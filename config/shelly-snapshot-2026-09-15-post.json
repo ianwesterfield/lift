@@ -1,0 +1,90 @@
+{
+  "deviceInfo": {
+    "name": "Lift",
+    "id": "shellypro3-8c4f008f5a18",
+    "mac": "8C4F008F5A18",
+    "slot": 1,
+    "model": "SPSW-003XE16EU",
+    "gen": 2,
+    "fw_id": "20260710-101217/2.0.0-g87fbfa4",
+    "ver": "2.0.0",
+    "app": "Pro3",
+    "auth_en": false,
+    "auth_domain": null,
+    "provision": "complete",
+    "enhanced_security": false
+  },
+  "switch0": {
+    "id": 0,
+    "name": "Up (Call)",
+    "in_mode": "detached",
+    "in_locked": false,
+    "initial_state": "off",
+    "auto_on": false,
+    "auto_on_delay": 60.0,
+    "auto_off": true,
+    "auto_off_delay": 55.0,
+    "counts": {
+      "enable": true
+    }
+  },
+  "input0": {
+    "id": 0,
+    "name": null,
+    "type": "switch",
+    "enable": true,
+    "invert": false
+  },
+  "switch1": {
+    "id": 1,
+    "name": "Down (Send)",
+    "in_mode": "detached",
+    "in_locked": false,
+    "initial_state": "off",
+    "auto_on": false,
+    "auto_on_delay": 62.0,
+    "auto_off": true,
+    "auto_off_delay": 45.0,
+    "counts": {
+      "enable": true
+    }
+  },
+  "input1": {
+    "id": 1,
+    "name": null,
+    "type": "switch",
+    "enable": true,
+    "invert": false
+  },
+  "switch2": {
+    "id": 2,
+    "name": null,
+    "in_mode": "follow",
+    "in_locked": false,
+    "initial_state": "match_input",
+    "auto_on": false,
+    "auto_on_delay": 60.0,
+    "auto_off": false,
+    "auto_off_delay": 60.0,
+    "counts": {
+      "enable": true
+    }
+  },
+  "input2": {
+    "id": 2,
+    "name": null,
+    "type": "switch",
+    "enable": false,
+    "invert": false
+  },
+  "scripts": {
+    "scripts": [
+      {
+        "id": 1,
+        "name": "lift-arbiter",
+        "enable": true,
+        "running": true
+      }
+    ]
+  }
+}

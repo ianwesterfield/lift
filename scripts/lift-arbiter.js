@@ -8,9 +8,9 @@
 // Inputs must be type "switch", in_mode "detached", initial_state "off".
 
 var CFG = {
-  ARB_MS: 75,       // arbitration window before energizing
+  ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  JOG_TAP_MS: 1000  // jog mode: release sooner than this = tap = latched trip
+  JOG_TAP_MS: 1000, // jog mode: release sooner than this = tap = latched trip
 };
 
 var UP = 0;
@@ -18,15 +18,15 @@ var DOWN = 1;
 var DIR_NAME = ["UP", "DOWN"];
 
 var S = {
-  state: "IDLE",      // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
+  state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  jog: false,         // set by interrupting a trip; cleared when a run ends via Auto-Off
-  latched: false,     // RUNNING: true = full trip, false = hold-to-run (jog)
-  earlyRelease: false,// button released during arbitration window (counts as tap)
+  jog: false, // set by interrupting a trip; cleared when a run ends via Auto-Off
+  latched: false, // RUNNING: true = full trip, false = hold-to-run (jog)
+  earlyRelease: false, // button released during arbitration window (counts as tap)
   pressTs: 0,
-  stopping: false,    // we commanded OFF; swallow the resulting status event
+  stopping: false, // we commanded OFF; swallow the resulting status event
   arbTimer: null,
-  cdTimer: null
+  cdTimer: null,
 };
 
 function log(msg) {
@@ -53,8 +53,14 @@ function bothOff() {
 }
 
 function clearTimers() {
-  if (S.arbTimer !== null) { Timer.clear(S.arbTimer); S.arbTimer = null; }
-  if (S.cdTimer !== null) { Timer.clear(S.cdTimer); S.cdTimer = null; }
+  if (S.arbTimer !== null) {
+    Timer.clear(S.arbTimer);
+    S.arbTimer = null;
+  }
+  if (S.cdTimer !== null) {
+    Timer.clear(S.cdTimer);
+    S.cdTimer = null;
+  }
 }
 
 function fault(reason) {
@@ -92,14 +98,16 @@ function request(dir, source) {
     return "fault";
   }
 
-  if (S.state === "RUNNING") { // any press during a trip = stop, unlock jog mode
+  if (S.state === "RUNNING") {
+    // any press during a trip = stop, unlock jog mode
     S.jog = true;
     stopTrip(DIR_NAME[dir] + " press during trip, " + source);
     return "stopped";
   }
 
   if (S.state === "PENDING") {
-    if (dir !== S.dir) { // opposite direction inside arbitration window
+    if (dir !== S.dir) {
+      // opposite direction inside arbitration window
       log("UP/DOWN conflict during arbitration — aborting");
       cooldown();
       return "conflict";
@@ -143,7 +151,11 @@ function startTrip(source) {
   S.latched = !(S.jog && source === "input" && !S.earlyRelease);
   S.pressTs = Date.now();
   setOut(S.dir, true);
-  log("RUNNING " + DIR_NAME[S.dir] + (S.latched ? " (latched)" : " (hold-to-run)"));
+  log(
+    "RUNNING " +
+      DIR_NAME[S.dir] +
+      (S.latched ? " (latched)" : " (hold-to-run)"),
+  );
 }
 
 function release(dir) {
@@ -163,7 +175,8 @@ function release(dir) {
 
 Shelly.addEventHandler(function (ev) {
   if (!ev.info || ev.info.event !== "toggle") return;
-  if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN) return;
+  if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN)
+    return;
   if (ev.info.state === true) request(ev.info.id, "input");
   else release(ev.info.id);
 });
@@ -178,7 +191,10 @@ Shelly.addStatusHandler(function (st) {
   }
 
   if (st.delta.output === false) {
-    if (S.stopping) { S.stopping = false; return; } // our own commanded stop
+    if (S.stopping) {
+      S.stopping = false;
+      return;
+    } // our own commanded stop
     if (S.state === "RUNNING" && st.id === S.dir) {
       // Firmware Auto-Off: ran to a limit → clear jog mode
       log("Auto-Off end of trip" + (S.jog ? " — jog mode cleared" : ""));
@@ -187,8 +203,12 @@ Shelly.addStatusHandler(function (st) {
     }
   } else {
     if (S.state !== "RUNNING" || st.id !== S.dir) {
-      fault("unexpected output ON: switch:" + st.id +
-            " source=" + (st.delta.source ? st.delta.source : "?"));
+      fault(
+        "unexpected output ON: switch:" +
+          st.id +
+          " source=" +
+          (st.delta.source ? st.delta.source : "?"),
+      );
     }
   }
 });
@@ -226,7 +246,7 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     result: result,
     state: S.state,
     dir: S.dir === null ? null : DIR_NAME[S.dir],
-    jog: S.jog
+    jog: S.jog,
   });
   res.send();
 });
@@ -242,13 +262,35 @@ function init() {
   for (var i = UP; i <= DOWN; i++) {
     var c = Shelly.getComponentConfig("switch:" + i);
     if (c) {
-      if (c.initial_state !== "off") log("WARN switch:" + i + " initial_state='" + c.initial_state + "' (want 'off')");
-      if (c.in_mode !== "detached") log("WARN switch:" + i + " in_mode='" + c.in_mode + "' (want 'detached')");
-      if (!c.auto_off) log("WARN switch:" + i + " auto_off DISABLED (firmware backstop required)");
+      if (c.initial_state !== "off")
+        log(
+          "WARN switch:" +
+            i +
+            " initial_state='" +
+            c.initial_state +
+            "' (want 'off')",
+        );
+      if (c.in_mode !== "detached")
+        log(
+          "WARN switch:" + i + " in_mode='" + c.in_mode + "' (want 'detached')",
+        );
+      if (!c.auto_off)
+        log(
+          "WARN switch:" +
+            i +
+            " auto_off DISABLED (firmware backstop required)",
+        );
     }
   }
-  log("armed — arbitration " + CFG.ARB_MS + "ms, cooldown " + CFG.COOLDOWN_MS +
-      "ms, jog tap " + CFG.JOG_TAP_MS + "ms");
+  log(
+    "armed — arbitration " +
+      CFG.ARB_MS +
+      "ms, cooldown " +
+      CFG.COOLDOWN_MS +
+      "ms, jog tap " +
+      CFG.JOG_TAP_MS +
+      "ms",
+  );
 }
 
 init();

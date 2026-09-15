@@ -21,16 +21,16 @@ O3/S3 unused/reserved
 
 ## Firmware configuration (required)
 
-| Setting | Value | Why |
-| --- | --- | --- |
-| switch:0 `auto_off` | enabled, **55 s** | Hard maximum UP command duration. Harmar limits stop motion; this just ends the command. Script never refreshes it. |
-| switch:1 `auto_off` | enabled, **45 s** | Same, DOWN. |
-| switch:0/1 `initial_state` | **`off`** | Fail-safe boot. ⚠️ Was `match_input` — with that, restoring power while a Phoenix relay is energized (stuck/welded button) would re-energize a motion output. |
-| switch:0/1 `in_mode` | **`detached`** | Only the script commands O1/O2. ⚠️ Was Activation Switch. |
-| input:0/1 `type` | `switch` | Momentary press seen as level; script acts on `toggle` events. |
-| Script | **Run on startup** | Buttons are dead without it once inputs are detached. |
+| Setting                    | Value              | Why                                                                                                                                                           |
+| -------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| switch:0 `auto_off`        | enabled, **55 s**  | Hard maximum UP command duration. Harmar limits stop motion; this just ends the command. Script never refreshes it.                                           |
+| switch:1 `auto_off`        | enabled, **45 s**  | Same, DOWN.                                                                                                                                                   |
+| switch:0/1 `initial_state` | **`off`**          | Fail-safe boot. ⚠️ Was `match_input` — with that, restoring power while a Phoenix relay is energized (stuck/welded button) would re-energize a motion output. |
+| switch:0/1 `in_mode`       | **`detached`**     | Only the script commands O1/O2. ⚠️ Was Activation Switch.                                                                                                     |
+| input:0/1 `type`           | `switch`           | Momentary press seen as level; script acts on `toggle` events.                                                                                                |
+| Script                     | **Run on startup** | Buttons are dead without it once inputs are detached.                                                                                                         |
 
-**Migration order matters:** upload script → enable run-on-startup → confirm running → *then* set `in_mode: detached`. Detaching first leaves the lift with no working buttons.
+**Migration order matters:** upload script → enable run-on-startup → confirm running → _then_ set `in_mode: detached`. Detaching first leaves the lift with no working buttons.
 
 Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip, the active output still turns off at 55/45 s. The script must never re-issue `Switch.Set on` to extend a trip.
 
@@ -40,26 +40,26 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 
 ### Normal mode (tap = trip)
 
-| Event | Result |
-| --- | --- |
-| Press UP or DOWN while IDLE | 75 ms arbitration window, then latched full trip (Auto-Off ends it) |
-| Same-direction press while pending/running | Ignored |
-| Opposite press within arbitration window | Trip cancelled, neither output fires, cooldown |
-| **Any** press during a running trip | **STOP** (never reverse), enter **jog mode**, cooldown |
-| Trip ends via firmware Auto-Off | Reached a limit → cooldown → IDLE, stay in normal mode |
+| Event                                      | Result                                                              |
+| ------------------------------------------ | ------------------------------------------------------------------- |
+| Press UP or DOWN while IDLE                | 75 ms arbitration window, then latched full trip (Auto-Off ends it) |
+| Same-direction press while pending/running | Ignored                                                             |
+| Opposite press within arbitration window   | Trip cancelled, neither output fires, cooldown                      |
+| **Any** press during a running trip        | **STOP** (never reverse), enter **jog mode**, cooldown              |
+| Trip ends via firmware Auto-Off            | Reached a limit → cooldown → IDLE, stay in normal mode              |
 
 ### Jog mode (entered by interrupting a trip = platform mid-shaft)
 
-| Event | Result |
-| --- | --- |
-| Press and **hold** (≥ 1 s) | Output on while held; release = stop (fine positioning), stay in jog mode |
-| Quick **tap** (< 1 s) | Latched full trip |
-| Any run that ends via firmware Auto-Off | Drove to a limit → **exit jog mode**, back to tap-=-trip |
-| Any press during a latched trip | STOP, stay in jog mode |
+| Event                                   | Result                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------- |
+| Press and **hold** (≥ 1 s)              | Output on while held; release = stop (fine positioning), stay in jog mode |
+| Quick **tap** (< 1 s)                   | Latched full trip                                                         |
+| Any run that ends via firmware Auto-Off | Drove to a limit → **exit jog mode**, back to tap-=-trip                  |
+| Any press during a latched trip         | STOP, stay in jog mode                                                    |
 
 ### Invariants
 
-1. O1 and O2 never ON simultaneously — verified before every trip *and* watched via status handler.
+1. O1 and O2 never ON simultaneously — verified before every trip _and_ watched via status handler.
 2. State transitions to RUNNING **before** the relay is commanded ON (no accept-both race).
 3. `Switch.Set` only; never `Switch.Toggle`.
 4. 400 ms cooldown after any stop before re-arm.
