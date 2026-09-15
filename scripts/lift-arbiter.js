@@ -67,6 +67,34 @@ function setOut(id, on) {
   Shelly.call("Switch.Set", { id: id, on: on });
 }
 
+// Firmware allows ~5 concurrent outbound calls; a terminal declaration bursts 6
+// (2x Switch.Set + 2x KVS.Set + 2x webhook) and crashes the script ("Too many
+// calls in progress"). Switch.Set stays direct (≤2 at once, never delayed);
+// everything else shares 2 queue slots => ≤4 concurrent total.
+var Q = { inflight: 0, jobs: [] };
+
+function rpc(method, params, tag) {
+  Q.jobs.push({ m: method, p: params, t: tag });
+  pump();
+}
+
+function pump() {
+  while (Q.inflight < 2 && Q.jobs.length > 0) {
+    var j = Q.jobs.splice(0, 1)[0];
+    Q.inflight++;
+    Shelly.call(
+      j.m,
+      j.p,
+      function (r, ec, em, ud) {
+        Q.inflight--;
+        if (ec !== 0) log(ud + " failed: " + em);
+        pump();
+      },
+      j.t,
+    );
+  }
+}
+
 function bothOff() {
   setOut(UP, false);
   setOut(DOWN, false);
@@ -83,9 +111,7 @@ function pushPos() {
       JSON.stringify(bottom),
   ];
   for (var i = 0; i < urls.length; i++) {
-    Shelly.call("HTTP.GET", { url: urls[i], timeout: 5 }, function (r, ec, em) {
-      if (ec !== 0) log("webhook push failed: " + em);
-    });
+    rpc("HTTP.GET", { url: urls[i], timeout: 5 }, "webhook");
   }
 }
 
@@ -93,16 +119,20 @@ function setPos(p) {
   if (S.pos === p) return;
   S.pos = p;
   log("position: " + p);
-  Shelly.call("KVS.Set", { key: CFG.POS_KEY, value: p });
+  rpc("KVS.Set", { key: CFG.POS_KEY, value: p }, "kvs pos");
   pushPos();
 }
 
 function setEst(e) {
   S.est = e;
-  Shelly.call("KVS.Set", {
-    key: CFG.EST_KEY,
-    value: e === null ? "" : JSON.stringify(e),
-  });
+  rpc(
+    "KVS.Set",
+    {
+      key: CFG.EST_KEY,
+      value: e === null ? "" : JSON.stringify(e),
+    },
+    "kvs est",
+  );
 }
 
 // integrate elapsed run time into the travel estimate
