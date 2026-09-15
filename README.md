@@ -79,22 +79,38 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 The script registers an HTTP endpoint (Gen2 scripts cannot register RPC methods; `HTTPServer.registerEndpoint` is the supported mechanism):
 
 ```
-http://192.168.40.105/script/<id>/lift            → status JSON
-http://192.168.40.105/script/<id>/lift?dir=up     → request UP (same arbiter path as buttons)
-http://192.168.40.105/script/<id>/lift?dir=down   → request DOWN
-http://192.168.40.105/script/<id>/lift?cmd=stop   → stop a running trip (enters jog mode)
-http://192.168.40.105/script/<id>/lift?cmd=reset  → clear FAULT lockout
+http://192.168.40.105/script/1/lift             → status JSON {result, state, dir, jog, pos}
+http://192.168.40.105/script/1/lift?dir=up      → request UP (same arbiter path as buttons)
+http://192.168.40.105/script/1/lift?dir=down    → request DOWN
+http://192.168.40.105/script/1/lift?cmd=stop    → stop a running trip (enters jog mode)
+http://192.168.40.105/script/1/lift?cmd=reset   → clear FAULT lockout
+http://192.168.40.105/script/1/lift?set=top|bottom|mid → manual position calibration (IDLE only)
 ```
 
 HTTP requests are always treated as taps (latched trips) — hold semantics are physical-only.
 
-### HomeKit plan (phase 2)
+## Position tracking (script inference, no sensors)
 
-1. **Remove** the shelly-ds9 "Lift Switch" accessories from Homebridge — they issue direct `Switch.Set` and bypass the arbiter.
-2. Add two momentary stateless switches in Homebridge (e.g., `homebridge-http-switch`) hitting `?dir=up` / `?dir=down`.
-3. Wrap each in a HomeKit scene ("Lift up" / "Lift down") for natural Siri phrasing.
+`pos ∈ top | bottom | mid | unknown`, persisted in device KVS (`lift.pos`):
 
-No call queuing: with no floor-position feedback wired to the Shelly, "elevator behavior" = mutual exclusion + Model B, not stored calls.
+- Trip start writes `mid` to KVS **before** energizing — power loss mid-trip can never restore a stale floor.
+- A run ending via **firmware Auto-Off** drove to that direction's limit → `top` / `bottom`. (Auto-Off ≥ travel time, Harmar limits stop motion — valid even for trips started mid-shaft.)
+- Any manual stop / jog release → `mid`.
+- Boot restores from KVS; `unknown` only before first-ever calibration/trip.
+- Calibrate anytime while IDLE with `?set=top|bottom`.
+
+Every position change is pushed to Homebridge (`homebridge-http-webhooks` listener at `http://192.168.10.175:51828`, accessory IDs `lift-top` / `lift-bottom`) — no polling.
+
+### HomeKit (deployed 2026-09-15)
+
+ShellyDS9 platform **removed** from Homebridge (its direct `Switch.Set` bypassed the arbiter). Replaced by `HttpWebHooks` platform (setup script: homebridge repo `scripts/setup-lift-webhooks.sh`):
+
+| Accessory | Type | Behavior |
+| --- | --- | --- |
+| Lift Up / Lift Down | pushbutton | fires `?dir=up` / `?dir=down` through the arbiter |
+| Lift Upstairs / Lift Downstairs | occupancy sensor | "Detected" = lift at that floor; both clear = mid-shaft/moving/unknown |
+
+For Siri phrasing, wrap the pushbuttons in Home-app scenes ("Lift up" / "Lift down") — must be done in the Home app.
 
 ## Test plan
 
@@ -110,6 +126,7 @@ Use short Auto-Off values (e.g., 5 s) for steps 1–7, restore 55/45 for 8–9.
 8. Reboot mid-trip → both outputs OFF at boot, state IDLE.
 9. Stop the script mid-trip → firmware Auto-Off still ends the trip.
 10. Throughout: confirm O1 and O2 are never ON together (watch both channel LEDs / status).
+11. Position: full trip up → "Lift Upstairs" detected in HomeKit; interrupt a trip → both sensors clear; reboot → position survives.
 
 ## Files
 

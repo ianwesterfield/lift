@@ -11,6 +11,8 @@ var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
   JOG_TAP_MS: 1000, // jog mode: release sooner than this = tap = latched trip
+  POS_KEY: "lift.pos", // KVS key for persisted position
+  HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
 };
 
 var UP = 0;
@@ -27,6 +29,7 @@ var S = {
   stopping: false, // we commanded OFF; swallow the resulting status event
   arbTimer: null,
   cdTimer: null,
+  pos: "unknown", // top | bottom | mid | unknown (script inference, not a sensor)
 };
 
 function log(msg) {
@@ -50,6 +53,31 @@ function setOut(id, on) {
 function bothOff() {
   setOut(UP, false);
   setOut(DOWN, false);
+}
+
+function pushPos() {
+  // Two occupancy sensors in Homebridge; mid/unknown = both clear
+  var top = S.pos === "top";
+  var bottom = S.pos === "bottom";
+  var urls = [
+    CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + JSON.stringify(top),
+    CFG.HB_WEBHOOK +
+      "/?accessoryId=lift-bottom&state=" +
+      JSON.stringify(bottom),
+  ];
+  for (var i = 0; i < urls.length; i++) {
+    Shelly.call("HTTP.GET", { url: urls[i], timeout: 5 }, function (r, ec, em) {
+      if (ec !== 0) log("webhook push failed: " + em);
+    });
+  }
+}
+
+function setPos(p) {
+  if (S.pos === p) return;
+  S.pos = p;
+  log("position: " + p);
+  Shelly.call("KVS.Set", { key: CFG.POS_KEY, value: p });
+  pushPos();
 }
 
 function clearTimers() {
@@ -150,6 +178,7 @@ function startTrip(source) {
   // HTTP requests and normal mode are always latched full trips.
   S.latched = !(S.jog && source === "input" && !S.earlyRelease);
   S.pressTs = Date.now();
+  setPos("mid"); // persisted before energizing: power loss mid-trip never restores a floor
   setOut(S.dir, true);
   log(
     "RUNNING " +
@@ -196,9 +225,10 @@ Shelly.addStatusHandler(function (st) {
       return;
     } // our own commanded stop
     if (S.state === "RUNNING" && st.id === S.dir) {
-      // Firmware Auto-Off: ran to a limit → clear jog mode
+      // Firmware Auto-Off: ran to a limit → clear jog mode, floor is known
       log("Auto-Off end of trip" + (S.jog ? " — jog mode cleared" : ""));
       S.jog = false;
+      setPos(st.id === UP ? "top" : "bottom");
       cooldown();
     }
   } else {
@@ -239,6 +269,18 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     result = request(UP, "http");
   } else if (q.indexOf("dir=down") !== -1) {
     result = request(DOWN, "http");
+  } else if (q.indexOf("set=") !== -1) {
+    // manual position calibration, only while stationary
+    var p = null;
+    if (q.indexOf("set=top") !== -1) p = "top";
+    else if (q.indexOf("set=bottom") !== -1) p = "bottom";
+    else if (q.indexOf("set=mid") !== -1) p = "mid";
+    if (p !== null && S.state === "IDLE") {
+      setPos(p);
+      result = "calibrated";
+    } else {
+      result = "set-refused";
+    }
   }
 
   res.code = 200;
@@ -247,6 +289,7 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     state: S.state,
     dir: S.dir === null ? null : DIR_NAME[S.dir],
     jog: S.jog,
+    pos: S.pos,
   });
   res.send();
 });
@@ -257,6 +300,12 @@ function init() {
   S.dir = null;
   S.jog = false;
   S.latched = false;
+
+  Shelly.call("KVS.Get", { key: CFG.POS_KEY }, function (r, ec) {
+    if (ec === 0 && r && typeof r.value === "string") S.pos = r.value;
+    log("position restored: " + S.pos);
+    pushPos(); // sync Homebridge sensors with reality at boot
+  });
   S.stopping = false;
 
   for (var i = UP; i <= DOWN; i++) {
