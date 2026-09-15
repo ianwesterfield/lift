@@ -10,7 +10,8 @@
 var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  JOG_TAP_MS: 1000, // jog mode: release sooner than this = tap = latched trip
+  TAP_MS: 400, // jog mode: press shorter than this = tap (arms double-tap)
+  DBL_MS: 500, // jog mode: 2nd same-direction press within this of a tap = full trip
   POS_KEY: "lift.pos", // KVS key for persisted position
   HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
 };
@@ -24,7 +25,9 @@ var S = {
   dir: null,
   jog: false, // set by interrupting a trip; cleared when a run ends via Auto-Off
   latched: false, // RUNNING: true = full trip, false = hold-to-run (jog)
-  earlyRelease: false, // button released during arbitration window (counts as tap)
+  forceLatch: false, // double-tap detected: this trip is a latched full trip
+  lastTapDir: null, // jog double-tap arming
+  lastTapTs: 0,
   pressTs: 0,
   stopping: false, // we commanded OFF; swallow the resulting status event
   arbTimer: null,
@@ -143,7 +146,18 @@ function request(dir, source) {
     return "duplicate";
   }
 
-  if (S.state !== "IDLE") return "busy"; // COOLDOWN
+  var dbl =
+    S.jog && S.lastTapDir === dir && Date.now() - S.lastTapTs <= CFG.DBL_MS;
+
+  if (S.state === "COOLDOWN") {
+    // double-tap's 2nd press usually lands inside the post-tap cooldown;
+    // same-direction resume is safe to cut it short
+    if (!dbl) return "busy";
+    clearTimers();
+    S.state = "IDLE";
+  }
+
+  if (S.state !== "IDLE") return "busy";
 
   if (outOn(UP) || outOn(DOWN)) {
     fault("output ON while believed IDLE");
@@ -157,8 +171,11 @@ function request(dir, source) {
 
   S.state = "PENDING";
   S.dir = dir;
-  S.earlyRelease = false;
-  log(DIR_NAME[dir] + " pending (" + source + ")");
+  S.forceLatch = dbl;
+  S.lastTapDir = null; // consume the armed tap
+  log(
+    DIR_NAME[dir] + " pending (" + source + ")" + (dbl ? " [double-tap]" : ""),
+  );
   S.arbTimer = Timer.set(CFG.ARB_MS, false, function () {
     S.arbTimer = null;
     startTrip(source);
@@ -174,9 +191,10 @@ function startTrip(source) {
   // RUNNING before energizing: a press landing between here and relay closure
   // is treated as "press during trip" (stop), never a second acceptance.
   S.state = "RUNNING";
-  // In jog mode a physical press is undecided (hold vs tap) until release;
+  // Jog-mode physical press = hold-to-run unless it was a double-tap;
   // HTTP requests and normal mode are always latched full trips.
-  S.latched = !(S.jog && source === "input" && !S.earlyRelease);
+  S.latched = S.forceLatch || !(S.jog && source === "input");
+  S.forceLatch = false;
   S.pressTs = Date.now();
   setPos("mid"); // persisted before energizing: power loss mid-trip never restores a floor
   setOut(S.dir, true);
@@ -188,15 +206,23 @@ function startTrip(source) {
 }
 
 function release(dir) {
-  if (S.state === "PENDING" && dir === S.dir) {
-    S.earlyRelease = true; // tap faster than the arbitration window
+  if (S.state === "PENDING" && dir === S.dir && S.jog && !S.forceLatch) {
+    // released inside the arbitration window: no motion, just arm double-tap
+    clearTimers();
+    S.state = "IDLE";
+    S.dir = null;
+    S.lastTapDir = dir;
+    S.lastTapTs = Date.now();
+    log("tap " + DIR_NAME[dir] + " (double-tap armed)");
     return;
   }
   if (S.state === "RUNNING" && !S.latched && dir === S.dir) {
-    if (Date.now() - S.pressTs < CFG.JOG_TAP_MS) {
-      S.latched = true;
-      log("tap → latched full trip");
+    if (Date.now() - S.pressTs < CFG.TAP_MS) {
+      S.lastTapDir = dir; // short nudge counts as a tap: arms double-tap
+      S.lastTapTs = Date.now();
+      stopTrip("tap " + DIR_NAME[dir] + " (double-tap armed)");
     } else {
+      S.lastTapDir = null;
       stopTrip("jog release"); // stay in jog mode
     }
   }
@@ -336,8 +362,10 @@ function init() {
       CFG.ARB_MS +
       "ms, cooldown " +
       CFG.COOLDOWN_MS +
-      "ms, jog tap " +
-      CFG.JOG_TAP_MS +
+      "ms, tap " +
+      CFG.TAP_MS +
+      "ms, double-tap " +
+      CFG.DBL_MS +
       "ms",
   );
 }

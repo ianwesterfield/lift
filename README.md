@@ -50,12 +50,15 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 
 ### Jog mode (entered by interrupting a trip = platform mid-shaft)
 
-| Event                                   | Result                                                                    |
-| --------------------------------------- | ------------------------------------------------------------------------- |
-| Press and **hold** (≥ 1 s)              | Output on while held; release = stop (fine positioning), stay in jog mode |
-| Quick **tap** (< 1 s)                   | Latched full trip                                                         |
-| Any run that ends via firmware Auto-Off | Drove to a limit → **exit jog mode**, back to tap-=-trip                  |
-| Any press during a latched trip         | STOP, stay in jog mode                                                    |
+| Event                                    | Result                                                                     |
+| ---------------------------------------- | -------------------------------------------------------------------------- |
+| Press and **hold**                       | Output on while held; release = stop (fine positioning), stay in jog mode  |
+| Single **tap** (< 400 ms)                | Nudge at most (nothing if released within arbitration window); arms double-tap |
+| **Double-tap** (2nd press ≤ 500 ms after a tap, same direction) | Latched full trip — "resume full travel"           |
+| Any run that ends via firmware Auto-Off  | Drove to a limit → **exit jog mode**, back to tap = trip                   |
+| Any press during a latched trip          | STOP, stay in jog mode                                                     |
+
+HTTP/HomeKit requests are always latched full trips in either mode.
 
 ### Invariants
 
@@ -71,7 +74,8 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 
 - **Near-simultaneous UP+DOWN:** first press → PENDING + 75 ms timer. Opposite press inside the window cancels; neither output fires. Same-direction duplicates ignored.
 - **Event-order ambiguity at trip start:** state becomes RUNNING before `Switch.Set on`, so a press arriving between decision and relay closure is handled as "press during trip" (stop), never as a second acceptance.
-- **Tap released before the arbitration window closes:** counted as a tap → latched trip (no orphaned hold-state).
+- **Jog tap released before the arbitration window closes:** pending trip cancelled, no motion — the tap just arms the double-tap.
+- **Double-tap's second press lands during cooldown:** allowed through (same-direction re-energize after a tap is safe); opposite-direction presses during cooldown stay blocked.
 - **Held past Auto-Off in jog mode:** firmware kills the output; release afterwards is ignored (edge-triggered inputs mean the button must be released and re-pressed for a new request).
 
 ## Remote control endpoint
@@ -105,9 +109,9 @@ Every position change is pushed to Homebridge (`homebridge-http-webhooks` listen
 
 ShellyDS9 platform **removed** from Homebridge (its direct `Switch.Set` bypassed the arbiter). Replaced by `HttpWebHooks` platform (setup script: homebridge repo `scripts/setup-lift-webhooks.sh`):
 
-| Accessory | Type | Behavior |
-| --- | --- | --- |
-| Lift Up / Lift Down | pushbutton | fires `?dir=up` / `?dir=down` through the arbiter |
+| Accessory                       | Type             | Behavior                                                               |
+| ------------------------------- | ---------------- | ---------------------------------------------------------------------- |
+| Lift Up / Lift Down             | pushbutton       | fires `?dir=up` / `?dir=down` through the arbiter                      |
 | Lift Upstairs / Lift Downstairs | occupancy sensor | "Detected" = lift at that floor; both clear = mid-shaft/moving/unknown |
 
 For Siri phrasing, wrap the pushbuttons in Home-app scenes ("Lift up" / "Lift down") — must be done in the Home app.
