@@ -12,7 +12,7 @@ var CFG = {
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
   TAP_MS: 400, // jog mode: press shorter than this = tap (arms double-tap)
   DBL_MS: 500, // jog mode: 2nd same-direction press within this of a tap = full trip
-  TRAVEL_UP_MS: 55000, // full-travel dead-reckoning scale (matches Auto-Off)
+  TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
   EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
   RESET_HOLD_MS: 3000, // hold UP+DOWN together this long = state reset
@@ -99,14 +99,16 @@ function setPos(p) {
 
 function setEst(e) {
   S.est = e;
-  Shelly.call("KVS.Set", { key: CFG.EST_KEY, value: e === null ? "" : JSON.stringify(e) });
+  Shelly.call("KVS.Set", {
+    key: CFG.EST_KEY,
+    value: e === null ? "" : JSON.stringify(e),
+  });
 }
 
 // integrate elapsed run time into the travel estimate
 function updateEst(dirId, dtMs) {
   if (S.est === null || dtMs <= 0) return;
-  var d =
-    dirId === UP ? dtMs / CFG.TRAVEL_UP_MS : -dtMs / CFG.TRAVEL_DOWN_MS;
+  var d = dirId === UP ? dtMs / CFG.TRAVEL_UP_MS : -dtMs / CFG.TRAVEL_DOWN_MS;
   var e = S.est + d;
   if (e < 0) e = 0;
   if (e > 1) e = 1;
@@ -445,12 +447,20 @@ function init() {
   });
   var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
   S.limitFb = lc !== null && lc.enable === true;
-  log("S3 limit feedback: " + (S.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"));
+  log(
+    "S3 limit feedback: " +
+      (S.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"),
+  );
   S.stopping = false;
 
   for (var i = UP; i <= DOWN; i++) {
     var c = Shelly.getComponentConfig("switch:" + i);
     if (c) {
+      if (c.auto_off && typeof c.auto_off_delay === "number") {
+        // Auto-Off ≥ travel time, so it doubles as the full-travel scale
+        if (i === UP) CFG.TRAVEL_UP_MS = c.auto_off_delay * 1000;
+        else CFG.TRAVEL_DOWN_MS = c.auto_off_delay * 1000;
+      }
       if (c.initial_state !== "off")
         log(
           "WARN switch:" +
@@ -480,7 +490,11 @@ function init() {
       CFG.TAP_MS +
       "ms, double-tap " +
       CFG.DBL_MS +
-      "ms",
+      "ms, travel " +
+      CFG.TRAVEL_UP_MS / 1000 +
+      "s up / " +
+      CFG.TRAVEL_DOWN_MS / 1000 +
+      "s down (from auto_off_delay)",
   );
 }
 
