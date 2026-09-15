@@ -34,31 +34,30 @@ O3/S3 unused/reserved
 
 Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip, the active output still turns off at 55/45 s. The script must never re-issue `Switch.Set on` to extend a trip.
 
-## Behavior specification (Model B)
+## Behavior specification (simplified gestures, rev 3)
 
-States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `jog` mode flag overlays them.
+States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `jog` mode flag overlays them. **All presses of a multi-press command must land within 1 s.**
 
-### Normal mode (tap = trip)
+### Normal mode
 
-| Event                                      | Result                                                              |
-| ------------------------------------------ | ------------------------------------------------------------------- |
-| Press UP or DOWN while IDLE                | 75 ms arbitration window, then latched full trip (Auto-Off ends it) |
-| Same-direction press while pending/running | Ignored                                                             |
-| Opposite press within arbitration window   | Trip cancelled, neither output fires, cooldown                      |
-| **Any** press during a running trip        | **STOP** (never reverse), enter **jog mode**, cooldown              |
-| Trip ends via firmware Auto-Off            | Reached a limit → cooldown → IDLE, stay in normal mode              |
+| Event                                       | Result                                                                     |
+| ------------------------------------------- | --------------------------------------------------------------------------- |
+| Single press while IDLE                     | Latched full trip, starting after the 1 s double-tap window (Auto-Off ends it) |
+| **Double-tap** (2nd press within 1 s, same direction) | **Jog mode ON** — no motion                                       |
+| Opposite press within the pending window    | Trip cancelled, neither output fires, cooldown                              |
+| **Any** press during a running trip         | **STOP** (never reverse), cooldown — stays in normal mode                   |
+| Trip ends via firmware Auto-Off             | Reached a limit → cooldown → IDLE                                           |
 
-### Jog mode (entered by interrupting a trip = platform mid-shaft)
+### Jog mode (fine positioning)
 
-| Event                                                           | Result                                                                         |
-| --------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Press and **hold**                                              | Output on while held; release = stop (fine positioning), stay in jog mode      |
-| Single **tap** (< 400 ms)                                       | Nudge at most (nothing if released within arbitration window); arms double-tap |
-| **Double-tap** (2nd press ≤ 500 ms after a tap, same direction) | Latched full trip — "resume full travel"                                       |
-| Any run that ends via firmware Auto-Off                         | Drove to a limit → **exit jog mode**, back to tap = trip                       |
-| Any press during a latched trip                                 | STOP, stay in jog mode                                                         |
+| Event                                                          | Result                                                                    |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Press and **hold**                                             | Output on while held (75 ms arbitration); release = stop, stay in jog mode |
+| Single **tap** (< 400 ms)                                      | Nudge at most (nothing if released within 75 ms); arms jog-exit double-tap |
+| **Double-tap** (2nd press within 1 s of a tap, same direction) | **Jog mode OFF** — no motion                                               |
+| Any run that reaches a limit (Auto-Off / dead reckoning / S3)  | Floor declared → **exit jog mode** automatically                           |
 
-HTTP/HomeKit requests are always latched full trips in either mode.
+HTTP/HomeKit requests are always latched full trips in either mode (75 ms window only); `?cmd=jog` toggles jog mode remotely.
 
 ### Invariants
 
@@ -72,10 +71,10 @@ HTTP/HomeKit requests are always latched full trips in either mode.
 
 ### Race handling
 
-- **Near-simultaneous UP+DOWN:** first press → PENDING + 75 ms timer. Opposite press inside the window cancels; neither output fires. Same-direction duplicates ignored.
+- **Near-simultaneous UP+DOWN:** first press → PENDING (1 s normal / 75 ms jog+HTTP). Opposite press inside the window cancels; neither output fires.
 - **Event-order ambiguity at trip start:** state becomes RUNNING before `Switch.Set on`, so a press arriving between decision and relay closure is handled as "press during trip" (stop), never as a second acceptance.
-- **Jog tap released before the arbitration window closes:** pending trip cancelled, no motion — the tap just arms the double-tap.
-- **Double-tap's second press lands during cooldown:** allowed through (same-direction re-energize after a tap is safe); opposite-direction presses during cooldown stay blocked.
+- **Normal-mode double-tap:** the 2nd press lands while the trip is still PENDING (inside the 1 s window) → pending trip cancelled, jog toggled, no motion.
+- **Jog tap released before the arbitration window closes:** pending trip cancelled, no motion — the tap just arms the jog-exit double-tap.
 - **Held past Auto-Off in jog mode:** firmware kills the output; release afterwards is ignored (edge-triggered inputs mean the button must be released and re-pressed for a new request).
 
 ## Remote control endpoint
