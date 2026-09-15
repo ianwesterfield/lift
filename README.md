@@ -50,13 +50,13 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 
 ### Jog mode (entered by interrupting a trip = platform mid-shaft)
 
-| Event                                    | Result                                                                     |
-| ---------------------------------------- | -------------------------------------------------------------------------- |
-| Press and **hold**                       | Output on while held; release = stop (fine positioning), stay in jog mode  |
-| Single **tap** (< 400 ms)                | Nudge at most (nothing if released within arbitration window); arms double-tap |
-| **Double-tap** (2nd press ≤ 500 ms after a tap, same direction) | Latched full trip — "resume full travel"           |
-| Any run that ends via firmware Auto-Off  | Drove to a limit → **exit jog mode**, back to tap = trip                   |
-| Any press during a latched trip          | STOP, stay in jog mode                                                     |
+| Event                                                           | Result                                                                         |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Press and **hold**                                              | Output on while held; release = stop (fine positioning), stay in jog mode      |
+| Single **tap** (< 400 ms)                                       | Nudge at most (nothing if released within arbitration window); arms double-tap |
+| **Double-tap** (2nd press ≤ 500 ms after a tap, same direction) | Latched full trip — "resume full travel"                                       |
+| Any run that ends via firmware Auto-Off                         | Drove to a limit → **exit jog mode**, back to tap = trip                       |
+| Any press during a latched trip                                 | STOP, stay in jog mode                                                         |
 
 HTTP/HomeKit requests are always latched full trips in either mode.
 
@@ -87,21 +87,29 @@ http://192.168.40.105/script/1/lift             → status JSON {result, state, 
 http://192.168.40.105/script/1/lift?dir=up      → request UP (same arbiter path as buttons)
 http://192.168.40.105/script/1/lift?dir=down    → request DOWN
 http://192.168.40.105/script/1/lift?cmd=stop    → stop a running trip (enters jog mode)
-http://192.168.40.105/script/1/lift?cmd=reset   → clear FAULT lockout
+http://192.168.40.105/script/1/lift?cmd=reset   → hard state reset (any state incl. FAULT; keeps position)
+http://192.168.40.105/script/1/lift?cmd=hist    → status + last 15 log lines (diagnostics)
 http://192.168.40.105/script/1/lift?set=top|bottom|mid → manual position calibration (IDLE only)
 ```
 
 HTTP requests are always treated as taps (latched trips) — hold semantics are physical-only.
 
+**Physical reset gesture:** hold UP + DOWN together ≥ 3 s → same hard reset (outputs off, timers cleared, jog/FAULT cleared, position kept). Works from any state.
+
 ## Position tracking (script inference, no sensors)
 
-`pos ∈ top | bottom | mid | unknown`, persisted in device KVS (`lift.pos`):
+`pos ∈ top | bottom | mid | unknown` plus a dead-reckoning travel estimate `est ∈ [0..1]` (0 = bottom, 1 = top); both persisted in device KVS (`lift.pos`, `lift.est`):
 
 - Trip start writes `mid` to KVS **before** energizing — power loss mid-trip can never restore a stale floor.
-- A run ending via **firmware Auto-Off** drove to that direction's limit → `top` / `bottom`. (Auto-Off ≥ travel time, Harmar limits stop motion — valid even for trips started mid-shaft.)
-- Any manual stop / jog release → `mid`.
-- Boot restores from KVS; `unknown` only before first-ever calibration/trip.
-- Calibrate anytime while IDLE with `?set=top|bottom`.
+- A run ending via **firmware Auto-Off** drove to that direction's limit → `top` / `bottom`, `est` = 1/0. (Auto-Off ≥ travel time, Harmar limits stop motion — valid even for trips started mid-shaft.)
+- **Dead reckoning:** every energized interval is integrated into `est` (55 s up / 45 s down full scale). A manual stop or jog release that brings `est` within 3% of an end declares that floor and **exits jog mode** — so jogging onto a limit is recognized without waiting for Auto-Off.
+- Other manual stops / jog releases → `mid`.
+- Boot restores from KVS; `unknown`/`est=null` only before first-ever calibration or completed trip.
+- Calibrate anytime while IDLE with `?set=top|bottom` (also sets `est`).
+
+### S3 hardware limit feedback (planned, NOT yet wired)
+
+Script support exists but is dormant until `input:2` is enabled. Wiring plan: both travel-limit indications in parallel → third Phoenix interposing relay → S3 = "platform at a terminal"; last commanded direction disambiguates top vs bottom. When S3 fires mid-run the script ends the command early and declares the floor — authoritative over dead reckoning. ⚠️ Tap the directional limit indications only; never the safety chain / final limits / safety pan. Enable: set `input:2` type=switch + enable=true, restart script, confirm boot log says `S3 limit feedback: ACTIVE`.
 
 Every position change is pushed to Homebridge (`homebridge-http-webhooks` listener at `http://192.168.10.175:51828`, accessory IDs `lift-top` / `lift-bottom`) — no polling.
 
@@ -131,6 +139,8 @@ Use short Auto-Off values (e.g., 5 s) for steps 1–7, restore 55/45 for 8–9.
 9. Stop the script mid-trip → firmware Auto-Off still ends the trip.
 10. Throughout: confirm O1 and O2 are never ON together (watch both channel LEDs / status).
 11. Position: full trip up → "Lift Upstairs" detected in HomeKit; interrupt a trip → both sensors clear; reboot → position survives.
+12. Dead reckoning: interrupt a trip, jog onto a limit, release → floor declared, jog mode exits (check `est` via status).
+13. Reset gesture: hold UP+DOWN 3 s → outputs off, state IDLE, jog cleared.
 
 ## Files
 

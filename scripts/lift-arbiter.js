@@ -12,7 +12,13 @@ var CFG = {
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
   TAP_MS: 400, // jog mode: press shorter than this = tap (arms double-tap)
   DBL_MS: 500, // jog mode: 2nd same-direction press within this of a tap = full trip
+  TRAVEL_UP_MS: 55000, // full-travel dead-reckoning scale (matches Auto-Off)
+  TRAVEL_DOWN_MS: 45000,
+  EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
+  RESET_HOLD_MS: 3000, // hold UP+DOWN together this long = state reset
+  LIMIT_IN: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
   POS_KEY: "lift.pos", // KVS key for persisted position
+  EST_KEY: "lift.est", // KVS key for persisted travel estimate
   HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
 };
 
@@ -23,20 +29,28 @@ var DIR_NAME = ["UP", "DOWN"];
 var S = {
   state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  jog: false, // set by interrupting a trip; cleared when a run ends via Auto-Off
+  jog: false, // set by interrupting a trip; cleared when a run ends at a limit
   latched: false, // RUNNING: true = full trip, false = hold-to-run (jog)
   forceLatch: false, // double-tap detected: this trip is a latched full trip
   lastTapDir: null, // jog double-tap arming
   lastTapTs: 0,
   pressTs: 0,
+  runOnTs: 0, // when the output actually energized (dead reckoning)
+  lastRunDir: null,
+  est: null, // 0=bottom..1=top travel estimate; null until first known floor
   stopping: false, // we commanded OFF; swallow the resulting status event
   arbTimer: null,
   cdTimer: null,
-  pos: "unknown", // top | bottom | mid | unknown (script inference, not a sensor)
+  resetTimer: null,
+  limitFb: false, // S3 hardware limit feedback available
+  hist: [], // ring buffer of recent log lines for ?cmd=hist
+  pos: "unknown", // top | bottom | mid | unknown
 };
 
 function log(msg) {
   print("[lift] " + msg);
+  S.hist.push(Math.round(Date.now() / 1000) + " " + msg);
+  if (S.hist.length > 15) S.hist.splice(0, 1);
 }
 
 function outOn(id) {
@@ -83,6 +97,37 @@ function setPos(p) {
   pushPos();
 }
 
+function setEst(e) {
+  S.est = e;
+  Shelly.call("KVS.Set", { key: CFG.EST_KEY, value: e === null ? "" : JSON.stringify(e) });
+}
+
+// integrate elapsed run time into the travel estimate
+function updateEst(dirId, dtMs) {
+  if (S.est === null || dtMs <= 0) return;
+  var d =
+    dirId === UP ? dtMs / CFG.TRAVEL_UP_MS : -dtMs / CFG.TRAVEL_DOWN_MS;
+  var e = S.est + d;
+  if (e < 0) e = 0;
+  if (e > 1) e = 1;
+  setEst(e);
+}
+
+// a run reached a terminal for certain (Auto-Off, S3 feedback)
+function atTerminal(dirId, why) {
+  S.jog = false;
+  setEst(dirId === UP ? 1 : 0);
+  setPos(dirId === UP ? "top" : "bottom");
+  log("at " + (dirId === UP ? "top" : "bottom") + " (" + why + ")");
+}
+
+// after a manual stop: dead reckoning may still conclude we reached a floor
+function declareFromEst() {
+  if (S.est === null || S.pos !== "mid") return;
+  if (S.est >= 1 - CFG.EST_EDGE) atTerminal(UP, "dead reckoning");
+  else if (S.est <= CFG.EST_EDGE) atTerminal(DOWN, "dead reckoning");
+}
+
 function clearTimers() {
   if (S.arbTimer !== null) {
     Timer.clear(S.arbTimer);
@@ -122,8 +167,34 @@ function stopTrip(reason) {
   cooldown();
 }
 
+// full state reset: hold UP+DOWN ≥ RESET_HOLD_MS (also clears FAULT); keeps position
+function hardReset(source) {
+  log("HARD RESET (" + source + ")");
+  clearTimers();
+  bothOff();
+  S.state = "IDLE";
+  S.dir = null;
+  S.jog = false;
+  S.latched = false;
+  S.forceLatch = false;
+  S.lastTapDir = null;
+  S.stopping = false;
+  S.runOnTs = 0;
+}
+
+function armResetGesture() {
+  if (S.resetTimer !== null) return;
+  S.resetTimer = Timer.set(CFG.RESET_HOLD_MS, false, function () {
+    S.resetTimer = null;
+    if (inOn(UP) && inOn(DOWN)) hardReset("both buttons held");
+  });
+}
+
 // Single entry point for ALL request sources (physical inputs, HTTP/HomeKit).
 function request(dir, source) {
+  // reset gesture works from ANY state, including FAULT
+  if (source === "input" && inOn(UP) && inOn(DOWN)) armResetGesture();
+
   if (S.state === "FAULT") {
     log("ignored " + DIR_NAME[dir] + " (" + source + "): FAULT lockout");
     return "fault";
@@ -196,6 +267,8 @@ function startTrip(source) {
   S.latched = S.forceLatch || !(S.jog && source === "input");
   S.forceLatch = false;
   S.pressTs = Date.now();
+  S.runOnTs = Date.now();
+  S.lastRunDir = S.dir;
   setPos("mid"); // persisted before energizing: power loss mid-trip never restores a floor
   setOut(S.dir, true);
   log(
@@ -206,6 +279,10 @@ function startTrip(source) {
 }
 
 function release(dir) {
+  if (S.resetTimer !== null) {
+    Timer.clear(S.resetTimer);
+    S.resetTimer = null;
+  }
   if (S.state === "PENDING" && dir === S.dir && S.jog && !S.forceLatch) {
     // released inside the arbitration window: no motion, just arm double-tap
     clearTimers();
@@ -230,11 +307,30 @@ function release(dir) {
 
 Shelly.addEventHandler(function (ev) {
   if (!ev.info || ev.info.event !== "toggle") return;
+  if (ev.component === "input:" + CFG.LIMIT_IN) {
+    if (S.limitFb && ev.info.state === true) limitHit();
+    return;
+  }
   if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN)
     return;
   if (ev.info.state === true) request(ev.info.id, "input");
   else release(ev.info.id);
 });
+
+// S3: platform physically reached a terminal; direction of travel disambiguates
+function limitHit() {
+  var d = S.state === "RUNNING" ? S.dir : S.lastRunDir;
+  if (d === null) {
+    log("limit feedback with no known direction — ignored");
+    return;
+  }
+  atTerminal(d, "S3 feedback");
+  if (S.state === "RUNNING") {
+    S.stopping = true;
+    bothOff(); // end the command; motion already ended at the Harmar limit
+    cooldown();
+  }
+}
 
 Shelly.addStatusHandler(function (st) {
   if (st.name !== "switch" || (st.id !== UP && st.id !== DOWN)) return;
@@ -246,15 +342,19 @@ Shelly.addStatusHandler(function (st) {
   }
 
   if (st.delta.output === false) {
+    // integrate actual energized time regardless of why it ended
+    if (S.runOnTs !== 0 && st.id === S.lastRunDir) {
+      updateEst(st.id, Date.now() - S.runOnTs);
+      S.runOnTs = 0;
+    }
     if (S.stopping) {
       S.stopping = false;
+      declareFromEst(); // manual stop may still have landed on a floor
       return;
-    } // our own commanded stop
+    }
     if (S.state === "RUNNING" && st.id === S.dir) {
-      // Firmware Auto-Off: ran to a limit → clear jog mode, floor is known
-      log("Auto-Off end of trip" + (S.jog ? " — jog mode cleared" : ""));
-      S.jog = false;
-      setPos(st.id === UP ? "top" : "bottom");
+      log("Auto-Off end of trip");
+      atTerminal(st.id, "Auto-Off");
       cooldown();
     }
   } else {
@@ -283,14 +383,10 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
       result = "not-running";
     }
   } else if (q.indexOf("cmd=reset") !== -1) {
-    if (S.state === "FAULT") {
-      bothOff();
-      S.jog = false;
-      cooldown();
-      result = "reset";
-    } else {
-      result = "not-faulted";
-    }
+    hardReset("http");
+    result = "reset";
+  } else if (q.indexOf("cmd=hist") !== -1) {
+    result = "hist";
   } else if (q.indexOf("dir=up") !== -1) {
     result = request(UP, "http");
   } else if (q.indexOf("dir=down") !== -1) {
@@ -302,6 +398,7 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     else if (q.indexOf("set=bottom") !== -1) p = "bottom";
     else if (q.indexOf("set=mid") !== -1) p = "mid";
     if (p !== null && S.state === "IDLE") {
+      setEst(p === "top" ? 1 : p === "bottom" ? 0 : null);
       setPos(p);
       result = "calibrated";
     } else {
@@ -309,14 +406,17 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     }
   }
 
-  res.code = 200;
-  res.body = JSON.stringify({
+  var body = {
     result: result,
     state: S.state,
     dir: S.dir === null ? null : DIR_NAME[S.dir],
     jog: S.jog,
     pos: S.pos,
-  });
+    est: S.est === null ? null : Math.round(S.est * 100) / 100,
+  };
+  if (result === "hist") body.hist = S.hist;
+  res.code = 200;
+  res.body = JSON.stringify(body);
   res.send();
 });
 
@@ -332,6 +432,20 @@ function init() {
     log("position restored: " + S.pos);
     pushPos(); // sync Homebridge sensors with reality at boot
   });
+  Shelly.call("KVS.Get", { key: CFG.EST_KEY }, function (r, ec) {
+    if (ec === 0 && r && r.value !== "" && typeof r.value === "string") {
+      var e = JSON.parse(r.value);
+      if (typeof e === "number") S.est = e;
+    }
+    if (S.est === null) {
+      // older deploys persisted pos only
+      if (S.pos === "top") S.est = 1;
+      else if (S.pos === "bottom") S.est = 0;
+    }
+  });
+  var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
+  S.limitFb = lc !== null && lc.enable === true;
+  log("S3 limit feedback: " + (S.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"));
   S.stopping = false;
 
   for (var i = UP; i <= DOWN; i++) {
