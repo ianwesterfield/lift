@@ -152,7 +152,7 @@ test("jog mode: hold-to-run, release stops", () => {
   baseline(env);
 });
 
-test("jog: opposite press stops (no auto-reverse in jog)", () => {
+test("jog: opposite press = two presses = jog OFF + stop (direction-agnostic)", () => {
   const env = boot();
   env.http("set=top");
   env.advance(200);
@@ -160,14 +160,43 @@ test("jog: opposite press stops (no auto-reverse in jog)", () => {
   env.advance(CHAIN_GAP);
   env.press(DOWN);
   env.advance(2000);
-  env.press(UP); // opposite while jog-holding
+  env.press(UP); // 2nd press of a chain: toggles jog off, stops the run
   env.advance(600);
   assert(!env.outputs[DOWN], "opposite press did not stop jog run");
   env.advance(2000);
-  assert(!env.outputs[UP], "jog auto-reversed (it must not)");
+  assert(!env.outputs[UP], "jog exit press started motion (it must not)");
+  const st = env.http("");
+  assert(st.jog === false, "jog not exited by two presses: " + JSON.stringify(st));
   env.release(DOWN);
   env.release(UP);
   env.advance(1000);
+  baseline(env);
+});
+
+test("quick opposite press within the chain window = jog toggle, NOT reverse", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  env.tap(DOWN, 80, 500); // run starts
+  env.tap(UP, 80); // 2nd press inside 3 s chain: jog ON, run stops
+  env.advance(1000);
+  const st = env.http("");
+  assert(!env.outputs[DOWN] && !env.outputs[UP], "motion after quick opposite");
+  assert(st.jog === true, "quick opposite did not toggle jog: " + JSON.stringify(st));
+  baseline(env);
+});
+
+test("mixed-direction triple = calibration (only press count matters)", () => {
+  const env = boot();
+  env.tap(UP, 60, 300);
+  env.tap(DOWN, 60, 300);
+  env.tap(UP, 60);
+  env.advance(2000);
+  const st = env.http("");
+  assert(st.calib === true, "mixed triple did not calibrate: " + JSON.stringify(st));
+  assert(env.outputs[UP], "calibration ride not running");
+  env.advance(60000);
+  assert(env.http("").pos === "top", "calibration did not complete");
   baseline(env);
 });
 

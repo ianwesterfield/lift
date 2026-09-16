@@ -35,7 +35,7 @@ var DOWN: Dir = 1;
 var DIR_NAME = ["UP", "DOWN"];
 
 var CFG = {
-  COOLDOWN_MS: 400, // stop -> reverse/re-arm dead-time
+  COOLDOWN_MS: 0, // stop -> reverse/re-arm dead-time
   DBL_MS: 3000, // gesture chain: presses within 3 s of the chain's first press
   TICK_MS: 25, // I/O drain tick
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
@@ -60,10 +60,10 @@ interface RelayCmd {
 }
 
 type IoJob =
-  | { kind: "relay"; m: "Switch.Set"; p: { id: Dir; on: boolean }; rc: RelayCmd }
-  | { kind: "job"; m: string; p: object; cb?: (r: unknown, ec: number, em: string) => void }
-  | { kind: "pos" | "est" | "bb"; m: "KVS.Set"; p: { key: string; value: string } }
-  | { kind: "wh"; m: "HTTP.GET"; p: { url: string; timeout: number } };
+  | { kind: "relay"; m: "Switch.Set"; p: { id: Dir; on: boolean; }; rc: RelayCmd; }
+  | { kind: "job"; m: string; p: object; cb?: (r: unknown, ec: number, em: string) => void; }
+  | { kind: "pos" | "est" | "bb"; m: "KVS.Set"; p: { key: string; value: string; }; }
+  | { kind: "wh"; m: "HTTP.GET"; p: { url: string; timeout: number; }; };
 
 // ---------------------------------------------------------------------------
 // IoQueue — the ONLY place Shelly.call happens. Everything else raises
@@ -88,6 +88,7 @@ class IoQueue {
     var self = this;
     Timer.set(CFG.TICK_MS, true, function () {
       self.tick();
+      (self.owner as LiftArbiter).pump(); // re-arm / pending auto-starts
     });
   }
 
@@ -173,15 +174,14 @@ class IoQueue {
 
 class Gestures {
   private n = 0;
-  private dir: Dir | null = null;
   private startTs = 0;
 
-  classify(dir: Dir): { gesture: Gesture; n: number } {
-    if (this.dir === dir && Date.now() - this.startTs <= CFG.DBL_MS) {
+  // direction-agnostic: only the NUMBER of presses within the window matters
+  classify(): { gesture: Gesture; n: number; } {
+    if (Date.now() - this.startTs <= CFG.DBL_MS) {
       this.n++;
     } else {
       this.n = 1;
-      this.dir = dir;
       this.startTs = Date.now();
     }
     if (this.n === 3) {
@@ -194,7 +194,6 @@ class Gestures {
 
   reset(): void {
     this.n = 0;
-    this.dir = null;
     this.startTs = 0;
   }
 }
@@ -218,7 +217,7 @@ class LiftArbiter {
   offTs: [number, number] = [0, 0];
   est: number | null = null;
   stopping = false;
-  cdTimer: number | null = null;
+  cooldownUntil = 0; // re-arm gate; the tick promotes COOLDOWN->IDLE
   resetTimer: number | null = null;
   holdTimer: number | null = null;
   limitFb = false;
@@ -327,10 +326,7 @@ class LiftArbiter {
   // ---- state transitions ----
 
   clearTimers(): void {
-    if (this.cdTimer !== null) {
-      Timer.clear(this.cdTimer);
-      this.cdTimer = null;
-    }
+    this.cooldownUntil = 0;
   }
 
   fault(reason: string): void {
@@ -344,34 +340,37 @@ class LiftArbiter {
     this.nextDir = null;
   }
 
+  // COOLDOWN ends when the dead-time (possibly 0) has passed AND the relays
+  // are physically OFF with nothing in flight — promoted by the IO tick, so
+  // "zero cooldown" is really "as soon as the hardware confirms quiescent".
   cooldown(): void {
-    this.clearTimers();
     this.state = "COOLDOWN";
     this.dir = null;
-    var self = this;
-    this.cdTimer = Timer.set(
-      CFG.COOLDOWN_MS,
-      false,
-      this.guard("cdTimer", function () {
-        self.cdTimer = null;
-        self.state = "IDLE";
-        self.log("re-armed");
-        if (self.calibPending) {
-          if (self.inOn(UP) || self.inOn(DOWN)) {
-            self.cooldown(); // the calibration press is still held: wait it out
-            return;
-          }
-          self.calibPending = false;
-          self.nextDir = null;
-          self.startCalibTrip();
-        } else if (self.nextDir !== null) {
-          var d = self.nextDir;
-          self.nextDir = null;
-          var r = self.request(d, "reverse");
-          if (r !== "accepted") self.log("reverse did not start: " + r);
-        }
-      }),
-    );
+    this.cooldownUntil = Date.now() + CFG.COOLDOWN_MS;
+  }
+
+  // called every IO tick: re-arm and run any pending auto-start intents
+  pump(): void {
+    if (this.state !== "COOLDOWN") return;
+    if (Date.now() < this.cooldownUntil) return;
+    if (this.io.relay.length > 0) return; // relay commands still queued
+    if (this.outOn(UP) || this.outOn(DOWN)) return; // OFF not landed yet
+    this.state = "IDLE";
+    this.log("re-armed");
+    if (this.calibPending) {
+      if (this.inOn(UP) || this.inOn(DOWN)) {
+        this.cooldown(); // the calibration press is still held: wait it out
+        return;
+      }
+      this.calibPending = false;
+      this.nextDir = null;
+      this.startCalibTrip();
+    } else if (this.nextDir !== null) {
+      var d = this.nextDir;
+      this.nextDir = null;
+      var r = this.request(d, "reverse");
+      if (r !== "accepted") this.log("reverse did not start: " + r);
+    }
   }
 
   stopTrip(reason: string): void {
@@ -474,7 +473,7 @@ class LiftArbiter {
     }
 
     if (source === "input") {
-      var g = this.gestures.classify(dir);
+      var g = this.gestures.classify();
       this.log("press " + DIR_NAME[dir] + " " + g.n + " (" + this.state + (this.jog ? ",jog" : "") + ")");
       if (g.gesture === "calibrate") return this.startCalibration(source);
       if (g.gesture === "jogToggle") return this.toggleJog(dir);
@@ -567,8 +566,8 @@ class LiftArbiter {
     this.setOut(this.dir as Dir, true);
     this.log(
       "RUNNING " +
-        DIR_NAME[this.dir as Dir] +
-        (this.calib ? " (calibration)" : unlatched ? " (jog hold)" : ""),
+      DIR_NAME[this.dir as Dir] +
+      (this.calib ? " (calibration)" : unlatched ? " (jog hold)" : ""),
     );
     return true;
   }
@@ -646,9 +645,9 @@ class LiftArbiter {
       if (this.state !== "RUNNING" || id !== this.dir) {
         this.fault(
           "unexpected output ON: switch:" +
-            id +
-            " source=" +
-            (st.delta.source ? st.delta.source : "?"),
+          id +
+          " source=" +
+          (st.delta.source ? st.delta.source : "?"),
         );
       }
     }
@@ -663,7 +662,7 @@ class LiftArbiter {
 
     // est restore chained after pos restore: its fallback derives from pos
     this.io.pushJob("KVS.Get", { key: CFG.POS_KEY }, function (r, ec) {
-      var rv = r as { value?: unknown } | null;
+      var rv = r as { value?: unknown; } | null;
       if (ec === 0 && rv && typeof rv.value === "string") self.pos = rv.value as Pos;
       self.log("position restored: " + self.pos);
       self.io.whQueue = [
@@ -671,7 +670,7 @@ class LiftArbiter {
         CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (self.pos === "bottom"),
       ];
       self.io.pushJob("KVS.Get", { key: CFG.EST_KEY }, function (r2, ec2) {
-        var rv2 = r2 as { value?: unknown } | null;
+        var rv2 = r2 as { value?: unknown; } | null;
         if (ec2 === 0 && rv2 && rv2.value !== "" && typeof rv2.value === "string") {
           var e = JSON.parse(rv2.value);
           if (typeof e === "number") self.est = e;
@@ -705,15 +704,15 @@ class LiftArbiter {
       }
     }
     this.log(
-      "armed — rev10 classes, cooldown " +
-        CFG.COOLDOWN_MS +
-        "ms, chain " +
-        CFG.DBL_MS +
-        "ms, travel " +
-        CFG.TRAVEL_UP_MS / 1000 +
-        "s/" +
-        CFG.TRAVEL_DOWN_MS / 1000 +
-        "s",
+      "armed — rev11 direction-agnostic gestures, cooldown " +
+      CFG.COOLDOWN_MS +
+      "ms (tick-confirmed), chain " +
+      CFG.DBL_MS +
+      "ms, travel " +
+      CFG.TRAVEL_UP_MS / 1000 +
+      "s/" +
+      CFG.TRAVEL_DOWN_MS / 1000 +
+      "s",
     );
   }
 }
