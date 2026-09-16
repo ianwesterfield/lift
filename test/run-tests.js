@@ -96,37 +96,36 @@ test("opposite press during pending window = conflict, no motion", () => {
   baseline(env);
 });
 
-test("double press = trip cancelled, no jog, no motion", () => {
+test("double press = jog mode ON, no motion", () => {
   const env = boot();
   env.tap(UP, 80, 200);
   env.tap(UP, 80);
   env.advance(3000);
   const st = env.http("");
-  assert(!env.outputs[UP], "motion after 2-press cancel");
+  assert(!env.outputs[UP], "motion after double-press");
   assert(
-    !st.jog && st.state === "IDLE",
-    "unexpected state: " + JSON.stringify(st),
+    st.jog === true && st.state === "IDLE",
+    "jog not on: " + JSON.stringify(st),
   );
   baseline(env);
 });
 
-test("triple press = jog ON, no motion; triple again = jog OFF", () => {
+test("jog: tap + press = jog OFF + immediate full travel", () => {
   const env = boot();
-  env.tap(UP, 80, 200);
-  env.tap(UP, 80, 200);
-  env.tap(UP, 80);
-  env.advance(2000);
+  env.http("cmd=jog");
+  env.advance(100);
+  env.tap(UP, 60, 300); // quick tap arms the exit
+  env.press(UP); // second press: exit jog + travel
+  env.advance(300);
+  env.release(UP);
   let st = env.http("");
-  assert(st.jog === true, "jog not on after triple: " + JSON.stringify(st));
-  assert(!env.outputs[UP] && !env.outputs[DOWN], "motion during jog toggle");
-  env.tap(UP, 60, 200);
-  env.tap(UP, 60, 200);
-  env.tap(UP, 60);
-  env.advance(2000);
+  assert(st.jog === false, "jog not exited: " + JSON.stringify(st));
+  assert(env.outputs[UP], "travel did not start on jog-exit press");
+  env.advance(60000);
   st = env.http("");
   assert(
-    st.jog === false,
-    "jog not off after 2nd triple: " + JSON.stringify(st),
+    st.state === "IDLE" && st.pos === "top",
+    "trip did not complete: " + JSON.stringify(st),
   );
   baseline(env);
 });
@@ -326,28 +325,41 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
       "iter " + iter + ": output stuck on",
     );
 
-    // recoverability: exit jog if needed, then a single press must run a trip
+    // recoverability: exit jog if needed (tap+press also starts a trip)
     if (st.jog) {
-      env.tap(st.pos === "top" ? DOWN : UP, 60, 200);
-      env.tap(st.pos === "top" ? DOWN : UP, 60, 200);
-      env.tap(st.pos === "top" ? DOWN : UP, 60);
-      env.advance(2000);
+      const jd = st.pos === "top" ? DOWN : UP;
+      env.tap(jd, 60, 300);
+      env.press(jd);
+      env.advance(300);
+      env.release(jd);
+      env.advance(200);
       st = env.http("");
-      assert(!st.jog, "iter " + iter + ": triple-press did not exit jog");
+      assert(!st.jog, "iter " + iter + ": tap+press did not exit jog");
+      assert(
+        env.outputs[jd],
+        "iter " + iter + ": jog-exit press did not start travel",
+      );
+      env.advance(60000);
+      st = env.http("");
+      assert(
+        st.state === "IDLE" && !env.outputs[jd],
+        "iter " + iter + ": jog-exit trip did not finish",
+      );
+    } else {
+      const dir = st.pos === "top" ? DOWN : UP;
+      env.tap(dir, 100);
+      env.advance(1200);
+      assert(
+        env.outputs[dir],
+        "iter " + iter + ": recovery press did not start a trip",
+      );
+      env.advance(60000);
+      st = env.http("");
+      assert(
+        st.state === "IDLE" && !env.outputs[dir],
+        "iter " + iter + ": recovery trip did not finish",
+      );
     }
-    const dir = st.pos === "top" ? DOWN : UP;
-    env.tap(dir, 100);
-    env.advance(1200);
-    assert(
-      env.outputs[dir],
-      "iter " + iter + ": recovery press did not start a trip",
-    );
-    env.advance(60000);
-    st = env.http("");
-    assert(
-      st.state === "IDLE" && !env.outputs[dir],
-      "iter " + iter + ": recovery trip did not finish",
-    );
     baseline(env);
   }
 });

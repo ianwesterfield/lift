@@ -10,7 +10,8 @@
 var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  DBL_MS: 1000, // gesture window: each press within 1 s of the previous
+  TAP_MS: 400, // jog: press shorter than this = tap (arms the jog-exit press)
+  DBL_MS: 1000, // gesture window: 2nd press within 1 s of the previous
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
   EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
@@ -29,11 +30,10 @@ var DIR_NAME = ["UP", "DOWN"];
 var S = {
   state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  jog: false, // toggled ONLY by triple-press / ?cmd=jog / reset
+  jog: false, // ON: two quick presses (normal); OFF: tap+press (also starts travel)
   latched: false, // RUNNING: true = full trip, false = hold-to-run (jog)
-  seqN: 0, // same-direction press counter for gestures
-  seqDir: null,
-  seqTs: 0,
+  lastTapDir: null, // jog-exit arming: last quick tap in jog mode
+  lastTapTs: 0,
   pressTs: 0,
   runOnTs: 0, // when the output actually energized (dead reckoning)
   lastRunDir: null,
@@ -240,8 +240,7 @@ function hardReset(source) {
   S.dir = null;
   S.jog = false;
   S.latched = false;
-  S.seqN = 0;
-  S.seqDir = null;
+  S.lastTapDir = null;
   S.stopping = false;
   S.onPending = null;
   S.runOnTs = 0;
@@ -269,33 +268,13 @@ function request(dir, source) {
     return "fault";
   }
 
-  // same-direction press sequence: 3rd press within the chain toggles jog mode
-  if (source === "input") {
-    if (S.seqDir === dir && Date.now() - S.seqTs <= CFG.DBL_MS) S.seqN++;
-    else {
-      S.seqN = 1;
-      S.seqDir = dir;
-    }
-    S.seqTs = Date.now();
-    log("press " + DIR_NAME[dir] + " seq " + S.seqN + "/3 (" + S.state + ")");
-    if (S.seqN >= 3) {
-      S.seqN = 0;
-      S.seqDir = null;
-      if (S.state === "PENDING") {
-        clearTimers();
-        S.state = "IDLE";
-        S.dir = null;
-      } else if (S.state === "RUNNING") {
-        stopTrip("gesture press");
-      }
-      S.jog = !S.jog;
-      log("triple-press — jog mode " + (S.jog ? "ON" : "OFF"));
-      return S.jog ? "jog-on" : "jog-off";
-    }
-  }
+  if (source === "input")
+    log(
+      "press " + DIR_NAME[dir] + " (" + S.state + (S.jog ? ", jog" : "") + ")",
+    );
 
   if (S.state === "RUNNING") {
-    // any press during a trip = stop (mode unchanged)
+    // any press during a trip = stop (mode unchanged); next press = new trip
     stopTrip(DIR_NAME[dir] + " press during trip, " + source);
     return "stopped";
   }
@@ -308,17 +287,35 @@ function request(dir, source) {
       return "conflict";
     }
     if (!S.jog && source === "input") {
-      // 2nd press cancels the pending trip; a 3rd within 1 s toggles jog
+      // two quick presses = jog mode ON (trip cancelled, no motion)
       clearTimers();
       S.state = "IDLE";
       S.dir = null;
-      log("2nd press — pending trip cancelled (3rd within 1 s = jog toggle)");
-      return "cancelled";
+      S.jog = true;
+      log("double-press — jog mode ON");
+      return "jog-on";
     }
     return "duplicate";
   }
 
-  if (S.state !== "IDLE") return "busy"; // COOLDOWN (press still counted above)
+  // jog: tap then press within the window = jog OFF + full travel that direction
+  var jogExit =
+    S.jog &&
+    source === "input" &&
+    S.lastTapDir === dir &&
+    Date.now() - S.lastTapTs <= CFG.DBL_MS;
+  if (jogExit) {
+    S.lastTapDir = null;
+    S.jog = false;
+    log("double-press — jog OFF, full travel " + DIR_NAME[dir]);
+    if (S.state === "COOLDOWN") {
+      // the 2nd press usually lands in the post-tap cooldown; safe to cut short
+      clearTimers();
+      S.state = "IDLE";
+    }
+  }
+
+  if (S.state !== "IDLE") return "busy"; // COOLDOWN
 
   if (outOn(UP) || outOn(DOWN)) {
     fault("output ON while believed IDLE");
@@ -332,9 +329,10 @@ function request(dir, source) {
 
   S.state = "PENDING";
   S.dir = dir;
-  // normal-mode physical press waits out the gesture window; jog and HTTP
-  // use the short arbitration window only
-  var wait = !S.jog && source === "input" ? CFG.DBL_MS : CFG.ARB_MS;
+  S.lastTapDir = null;
+  // normal-mode physical press waits out the gesture window; jog-exit, jog
+  // and HTTP use the short arbitration window only
+  var wait = !S.jog && source === "input" && !jogExit ? CFG.DBL_MS : CFG.ARB_MS;
   log(DIR_NAME[dir] + " pending (" + source + ")");
   S.arbTimer = Timer.set(
     wait,
@@ -376,14 +374,27 @@ function release(dir) {
     S.resetTimer = null;
   }
   if (S.state === "PENDING" && dir === S.dir && S.jog) {
-    // jog: released inside the arbitration window — no motion
+    // jog: released inside the arbitration window — no motion, arms jog-exit
     clearTimers();
     S.state = "IDLE";
     S.dir = null;
+    S.lastTapDir = dir;
+    S.lastTapTs = Date.now();
+    log("tap " + DIR_NAME[dir] + " (press again within 1 s = full travel)");
     return;
   }
   if (S.state === "RUNNING" && !S.latched && dir === S.dir) {
-    stopTrip("jog release"); // stay in jog mode
+    if (Date.now() - S.pressTs < CFG.TAP_MS) {
+      // quick tap (short nudge): arms the jog-exit second press
+      S.lastTapDir = dir;
+      S.lastTapTs = Date.now();
+      stopTrip(
+        "tap " + DIR_NAME[dir] + " (press again within 1 s = full travel)",
+      );
+    } else {
+      S.lastTapDir = null;
+      stopTrip("jog release"); // stay in jog mode
+    }
   }
 }
 

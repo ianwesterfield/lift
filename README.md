@@ -34,27 +34,26 @@ O3/S3 unused/reserved
 
 Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip, the active output still turns off at 55/45 s. The script must never re-issue `Switch.Set on` to extend a trip.
 
-## Behavior specification (simplified gestures, rev 4)
+## Behavior specification (simplified gestures, rev 5)
 
-States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `jog` mode flag overlays them. **Each press of a multi-press gesture must land within 1 s of the previous (same direction).**
+States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `jog` mode flag overlays them. **The second press of a gesture must land within 1 s of the first.**
 
 ### Normal mode
 
 | Gesture                                  | Result                                                                      |
 | ---------------------------------------- | --------------------------------------------------------------------------- |
 | Single press                             | Latched full trip, starting after the 1 s gesture window (Auto-Off ends it) |
-| Two presses                              | Pending trip cancelled — no motion (doubles as the "oops, abort" gesture)   |
-| **Three presses**                        | **Jog mode ON** — no motion                                                 |
+| **Two quick presses**                    | **Jog mode ON** — trip cancelled, no motion                                 |
 | Opposite press within the pending window | Trip cancelled, neither output fires, cooldown                              |
-| **Any** press during a running trip      | **STOP** (never reverse), cooldown — stays in normal mode                   |
+| **Any** press during a running trip      | **STOP** (never reverse) — press again = full run that direction            |
 
-### Jog mode (fine positioning — persists until a three-press sequence)
+### Jog mode (fine positioning)
 
-| Gesture                                              | Result                                                        |
-| ---------------------------------------------------- | ------------------------------------------------------------- |
-| Press and **hold**                                   | Output on while held (75 ms arbitration); release = stop      |
-| **Three presses**                                    | **Jog mode OFF** — no motion; a single press then = full trip |
-| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared; jog mode **persists** until a triple-press    |
+| Gesture                                              | Result                                                                   |
+| ---------------------------------------------------- | -------------------------------------------------------------------------- |
+| Press and **hold**                                   | Output on while held (75 ms arbitration); release = stop                    |
+| Quick **tap** (< 400 ms), then **press** within 1 s  | **Jog mode OFF + immediate latched full travel in that direction**          |
+| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared; jog persists until the tap+press exit                       |
 
 HTTP/HomeKit requests are always latched full trips in either mode (75 ms window only); `?cmd=jog` toggles jog mode remotely. Hold UP+DOWN 3 s = hard reset from any state.
 
@@ -74,7 +73,7 @@ HTTP/HomeKit requests are always latched full trips in either mode (75 ms window
 - **Event-order ambiguity at trip start:** state becomes RUNNING before `Switch.Set on`, so a press arriving between decision and relay closure is handled as "press during trip" (stop), never as a second acceptance.
 - **Stop racing our own ON echo:** the commanded-ON status event may arrive after a stop already landed; tracked via `onPending` so it is never mistaken for a rogue output (was a real fuzzer-found bug).
 - **Stop racing Auto-Off:** `stopping` is only armed if an output is actually on, so a swallowed off-event can't strand the flag.
-- **Multi-press gestures:** the 2nd press cancels the pending trip while it is still PENDING; the 3rd toggles jog — motion never starts mid-gesture.
+- **Double-press:** the 2nd press cancels the trip while it is still PENDING — motion never starts mid-gesture; the jog-exit press deliberately starts travel (that IS the gesture).
 - **Held past Auto-Off in jog mode:** firmware kills the output; release afterwards is ignored (edge-triggered inputs mean the button must be released and re-pressed for a new request).
 
 ## Remote control endpoint
