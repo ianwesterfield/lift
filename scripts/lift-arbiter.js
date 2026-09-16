@@ -157,14 +157,10 @@ function setPos(p) {
 
 function setEst(e) {
   S.est = e;
-  rpc(
-    "KVS.Set",
-    {
-      key: CFG.EST_KEY,
-      value: e === null ? "" : JSON.stringify(e),
-    },
-    "kvs est",
-  );
+  // value precomputed: mJS mis-parses ternaries inside object literals
+  var v = "";
+  if (e !== null) v = JSON.stringify(e);
+  rpc("KVS.Set", { key: CFG.EST_KEY, value: v }, "kvs est");
 }
 
 // integrate elapsed run time into the travel estimate
@@ -281,6 +277,7 @@ function request(dir, source) {
       S.seqDir = dir;
     }
     S.seqTs = Date.now();
+    log("press " + DIR_NAME[dir] + " seq " + S.seqN + "/3 (" + S.state + ")");
     if (S.seqN >= 3) {
       S.seqN = 0;
       S.seqDir = null;
@@ -536,21 +533,23 @@ function init() {
   S.jog = false;
   S.latched = false;
 
+  // est restore chained after pos restore: its fallback derives from S.pos
   rpc("KVS.Get", { key: CFG.POS_KEY }, "kvs get pos", function (r, ec) {
     if (ec === 0 && r && typeof r.value === "string") S.pos = r.value;
     log("position restored: " + S.pos);
     pushPos(); // sync Homebridge sensors with reality at boot
-  });
-  rpc("KVS.Get", { key: CFG.EST_KEY }, "kvs get est", function (r, ec) {
-    if (ec === 0 && r && r.value !== "" && typeof r.value === "string") {
-      var e = JSON.parse(r.value);
-      if (typeof e === "number") S.est = e;
-    }
-    if (S.est === null) {
-      // older deploys persisted pos only
-      if (S.pos === "top") S.est = 1;
-      else if (S.pos === "bottom") S.est = 0;
-    }
+    rpc("KVS.Get", { key: CFG.EST_KEY }, "kvs get est", function (r2, ec2) {
+      if (ec2 === 0 && r2 && r2.value !== "" && typeof r2.value === "string") {
+        var e = JSON.parse(r2.value);
+        if (typeof e === "number") S.est = e;
+      }
+      if (S.est === null) {
+        // older deploys persisted pos only
+        if (S.pos === "top") S.est = 1;
+        else if (S.pos === "bottom") S.est = 0;
+      }
+      log("est restored: " + (S.est === null ? "null" : S.est));
+    });
   });
   var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
   S.limitFb = lc !== null && lc.enable === true;
