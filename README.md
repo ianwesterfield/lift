@@ -126,6 +126,7 @@ ShellyDS9 platform **removed** from Homebridge (its direct `Switch.Set` bypassed
 | Lift Up / Lift Down             | pushbutton       | fires `?dir=up` / `?dir=down` through the arbiter                      |
 | Lift Upstairs / Lift Downstairs | occupancy sensor | "Detected" = lift at that floor; both clear = mid-shaft/moving/unknown |
 | Lift Fault                      | occupancy sensor | "Detected" = FAULT lockout or watchdog revived a crashed script        |
+| Lift Calibration                | switch           | ON starts the calibration ride, OFF aborts it; the arbiter pushes its state back, so the toggle self-clears when the ride completes |
 
 For Siri phrasing, wrap the pushbuttons in Home-app scenes ("Lift up" / "Lift down") — must be done in the Home app.
 

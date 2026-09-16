@@ -204,6 +204,33 @@ test("calibration lockout escape: hold one paddle 3 s", () => {
   baseline(env);
 });
 
+test("HomeKit calibration toggle tracks calibration state", () => {
+  const env = boot();
+  env.advance(500);
+  const bootPush = env.webhooks.filter(
+    (u) => u.indexOf("lift-calibrate") !== -1,
+  );
+  assert(
+    bootPush.length > 0 &&
+      bootPush[bootPush.length - 1].indexOf("state=false") !== -1,
+    "boot did not sync toggle off: " + JSON.stringify(bootPush),
+  );
+  env.http("cmd=calibrate");
+  env.advance(1000);
+  let pushes = env.webhooks.filter((u) => u.indexOf("lift-calibrate") !== -1);
+  assert(
+    pushes[pushes.length - 1].indexOf("state=true") !== -1,
+    "calibrate start not pushed: " + JSON.stringify(pushes),
+  );
+  env.advance(60000); // ride completes via Auto-Off
+  pushes = env.webhooks.filter((u) => u.indexOf("lift-calibrate") !== -1);
+  assert(
+    pushes[pushes.length - 1].indexOf("state=false") !== -1,
+    "calibrate completion not pushed: " + JSON.stringify(pushes),
+  );
+  baseline(env);
+});
+
 test("UNEXPLAINED output ON (no user source) => FAULT; hold escape clears", () => {
   const env = boot();
   env.setOutputExternal(UP, true, "init"); // no deliberate source: rogue

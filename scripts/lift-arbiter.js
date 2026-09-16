@@ -201,6 +201,7 @@ var LiftArbiter = /** @class */ (function () {
         this.direction = null;
         this.calibrating = false; // calibration ride: paddle ignored until Auto-Off
         this.calibrationPending = false;
+        this.calibrationPushed = null; // last state sent to HomeKit (null = never)
         this.reverseTo = null; // reversal target after cooldown
         this.pendingTerminal = null; // terminal reached; declared by pump
         this.pendingTerminalWhy = "";
@@ -346,6 +347,13 @@ var LiftArbiter = /** @class */ (function () {
     // Floor/terminal work runs HERE (depth ~3), never in handler chains — the
     // handler->onOutputOff->declareFloor->atTerminal chain blew the mJS stack.
     LiftArbiter.prototype.pump = function () {
+        // keep the HomeKit calibration toggle in sync (covers every entry/exit
+        // path; first pass after boot pushes the initial state)
+        var calibrationNow = this.calibrating || this.calibrationPending;
+        if (calibrationNow !== this.calibrationPushed) {
+            this.calibrationPushed = calibrationNow;
+            this.io.webhookQueue.push(CFG.WEBHOOK_BASE + "/?accessoryId=lift-calibrate&state=" + calibrationNow);
+        }
         if (this.state !== "RUNNING" /* MachineState.Running */) {
             if (this.pendingTerminal !== null) {
                 var terminalDirection = this.pendingTerminal;
