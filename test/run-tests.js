@@ -1,17 +1,15 @@
-// Unit + fuzz tests for lift-arbiter.js. Run: node test/run-tests.js
+// Unit + fuzz tests for lift-arbiter.js (rev 6 modeless). Run: node test/run-tests.js
 "use strict";
 const { createEnv } = require("./shelly-mock");
 
 let passed = 0,
-  failed = 0,
-  current = "";
+  failed = 0;
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
 function test(name, fn) {
-  current = name;
   try {
     fn();
     passed++;
@@ -29,7 +27,15 @@ function boot() {
   return env;
 }
 
-// shared invariant check
+// double-press: quick tap, then press again inside the 1 s window
+function dbl(env, dir) {
+  env.tap(dir, 100, 250);
+  env.press(dir);
+  env.advance(200);
+  env.release(dir);
+  env.advance(50);
+}
+
 function baseline(env) {
   assert(env.bothOnViolations === 0, "both outputs were ON simultaneously");
   assert(env.crashed === null, "script crashed: " + env.crashed);
@@ -41,23 +47,42 @@ const UP = 0,
 
 // ---------- scripted cases ----------
 
-test("boot: outputs off, IDLE, normal mode", () => {
+test("boot: outputs off, IDLE", () => {
   const env = boot();
   const st = env.http("");
-  assert(
-    st.state === "IDLE" && !st.jog,
-    "not idle/normal: " + JSON.stringify(st),
-  );
+  assert(st.state === "IDLE", "not idle: " + JSON.stringify(st));
   assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs not off");
   baseline(env);
 });
 
-test("single press = latched full trip, Auto-Off ends at top", () => {
+test("press-and-hold = run while held; release = stop", () => {
+  const env = boot();
+  env.press(UP);
+  env.advance(500);
+  assert(env.outputs[UP], "not running while held");
+  env.advance(4500);
+  env.release(UP);
+  env.advance(1000);
+  const st = env.http("");
+  assert(!env.outputs[UP], "did not stop on release");
+  assert(st.state === "IDLE", "not idle after release");
+  baseline(env);
+});
+
+test("single quick tap = nudge only, no latched trip", () => {
   const env = boot();
   env.tap(UP, 100);
-  env.advance(1100); // gesture window
-  assert(env.outputs[UP], "UP output not on after gesture window");
-  env.advance(60000); // ride out auto-off
+  env.advance(3000);
+  assert(!env.outputs[UP], "tap latched a trip");
+  assert(env.http("").state === "IDLE", "not idle after tap");
+  baseline(env);
+});
+
+test("double-press = latched full trip, Auto-Off ends at top", () => {
+  const env = boot();
+  dbl(env, UP);
+  assert(env.outputs[UP], "double-press did not latch a trip");
+  env.advance(60000);
   const st = env.http("");
   assert(!env.outputs[UP], "output still on after auto-off");
   assert(
@@ -67,129 +92,28 @@ test("single press = latched full trip, Auto-Off ends at top", () => {
   baseline(env);
 });
 
-test("press during trip = stop, stays normal mode", () => {
+test("press during latched trip = stop; quick press again = resume travel", () => {
   const env = boot();
-  env.tap(UP, 100);
-  env.advance(5000); // running
-  assert(env.outputs[UP], "trip not running");
-  env.tap(DOWN, 100);
-  env.advance(1000);
+  env.http("set=top");
+  env.advance(100);
+  dbl(env, DOWN);
+  env.advance(10000); // partway down
+  env.tap(DOWN, 80, 300); // stop press (arms the double)
+  assert(!env.outputs[DOWN], "did not stop");
+  env.press(DOWN); // 2nd press within 1 s = remaining travel
+  env.advance(200);
+  env.release(DOWN);
+  assert(env.outputs[DOWN], "resume press did not latch remaining travel");
+  env.advance(50000);
   const st = env.http("");
-  assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs not off after stop");
   assert(
-    st.state === "IDLE" && !st.jog,
-    "should stay normal-mode IDLE: " + JSON.stringify(st),
+    st.state === "IDLE" && st.pos === "bottom",
+    "remaining travel did not complete: " + JSON.stringify(st),
   );
   baseline(env);
 });
 
 test("opposite press during pending window = conflict, no motion", () => {
-  const env = boot();
-  env.tap(UP, 50, 100);
-  env.tap(DOWN, 50);
-  env.advance(3000);
-  assert(
-    !env.outputs[UP] && !env.outputs[DOWN],
-    "motion after UP/DOWN conflict",
-  );
-  assert(env.http("").state === "IDLE", "not idle after conflict");
-  baseline(env);
-});
-
-test("double press = jog mode ON, no motion", () => {
-  const env = boot();
-  env.tap(UP, 80, 200);
-  env.tap(UP, 80);
-  env.advance(3000);
-  const st = env.http("");
-  assert(!env.outputs[UP], "motion after double-press");
-  assert(
-    st.jog === true && st.state === "IDLE",
-    "jog not on: " + JSON.stringify(st),
-  );
-  baseline(env);
-});
-
-test("jog: tap + press = jog OFF + immediate full travel", () => {
-  const env = boot();
-  env.http("cmd=jog");
-  env.advance(100);
-  env.tap(UP, 60, 300); // quick tap arms the exit
-  env.press(UP); // second press: exit jog + travel
-  env.advance(300);
-  env.release(UP);
-  let st = env.http("");
-  assert(st.jog === false, "jog not exited: " + JSON.stringify(st));
-  assert(env.outputs[UP], "travel did not start on jog-exit press");
-  env.advance(60000);
-  st = env.http("");
-  assert(
-    st.state === "IDLE" && st.pos === "top",
-    "trip did not complete: " + JSON.stringify(st),
-  );
-  baseline(env);
-});
-
-test("jog: hold runs while held, stops on release", () => {
-  const env = boot();
-  env.http("cmd=jog");
-  env.press(DOWN);
-  env.advance(500);
-  assert(env.outputs[DOWN], "jog hold not running");
-  env.advance(4500);
-  env.release(DOWN);
-  env.advance(1000);
-  const st = env.http("");
-  assert(!env.outputs[DOWN], "jog did not stop on release");
-  assert(st.jog === true, "jog mode lost after release");
-  baseline(env);
-});
-
-test("jog persists at limit only via est=null; declared floor keeps jog until triple", () => {
-  const env = boot();
-  env.http("set=top");
-  env.advance(100);
-  env.http("cmd=jog");
-  env.press(DOWN);
-  env.advance(46000); // held past DOWN auto-off (45s)
-  env.release(DOWN);
-  env.advance(1000);
-  const st = env.http("");
-  assert(
-    st.pos === "bottom",
-    "auto-off run should declare bottom: " + JSON.stringify(st),
-  );
-  assert(st.jog === true, "jog must persist until triple-press");
-  baseline(env);
-});
-
-test("dead reckoning: mid-trip stop tracks est; jog to floor declares it", () => {
-  const env = boot();
-  env.http("set=top");
-  env.advance(100);
-  env.tap(DOWN, 100);
-  env.advance(1100); // trip starts
-  env.advance(22500); // ~half of 45s
-  env.tap(DOWN, 100); // stop mid-shaft
-  env.advance(1000);
-  let st = env.http("");
-  assert(st.pos === "mid", "should be mid: " + JSON.stringify(st));
-  assert(st.est > 0.35 && st.est < 0.65, "est not ~0.5: " + st.est);
-  // jog the rest of the way down
-  env.http("cmd=jog");
-  env.press(DOWN);
-  env.advance(st.est * 45000 + 500);
-  env.release(DOWN);
-  env.advance(1000);
-  st = env.http("");
-  assert(
-    st.pos === "bottom" && st.est === 0,
-    "jog to limit not declared: " + JSON.stringify(st),
-  );
-  baseline(env);
-});
-
-test("near-simultaneous UP+DOWN = no motion ever", () => {
   const env = boot();
   env.press(UP);
   env.advance(30);
@@ -198,16 +122,52 @@ test("near-simultaneous UP+DOWN = no motion ever", () => {
   env.release(UP);
   env.release(DOWN);
   env.advance(3000);
+  assert(!env.outputs[UP] && !env.outputs[DOWN], "motion after conflict");
+  assert(env.http("").state === "IDLE", "not idle after conflict");
+  baseline(env);
+});
+
+test("hold past Auto-Off declares the floor", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(100);
+  env.press(DOWN);
+  env.advance(46000); // held past DOWN auto-off (45 s)
+  env.release(DOWN);
+  env.advance(1000);
+  const st = env.http("");
   assert(
-    !env.outputs[UP] && !env.outputs[DOWN],
-    "motion after simultaneous press",
+    st.pos === "bottom" && st.state === "IDLE",
+    "hold to limit not declared: " + JSON.stringify(st),
   );
   baseline(env);
 });
 
-test("hold UP+DOWN 3s = hard reset (clears jog)", () => {
+test("dead reckoning: stop tracks est; hold to floor declares it", () => {
   const env = boot();
-  env.http("cmd=jog");
+  env.http("set=top");
+  env.advance(100);
+  dbl(env, DOWN);
+  env.advance(22500); // ~half of 45 s
+  env.tap(DOWN, 80); // stop mid-shaft
+  env.advance(1500); // outlive the double window
+  let st = env.http("");
+  assert(st.pos === "mid", "should be mid: " + JSON.stringify(st));
+  assert(st.est > 0.35 && st.est < 0.65, "est not ~0.5: " + st.est);
+  env.press(DOWN); // hold the rest of the way
+  env.advance(st.est * 45000 + 500);
+  env.release(DOWN);
+  env.advance(1000);
+  st = env.http("");
+  assert(
+    st.pos === "bottom" && st.est === 0,
+    "hold to limit not declared: " + JSON.stringify(st),
+  );
+  baseline(env);
+});
+
+test("hold UP+DOWN 3s = hard reset", () => {
+  const env = boot();
   env.press(UP);
   env.advance(30);
   env.press(DOWN);
@@ -216,31 +176,29 @@ test("hold UP+DOWN 3s = hard reset (clears jog)", () => {
   env.release(DOWN);
   env.advance(1000);
   const st = env.http("");
-  assert(
-    st.state === "IDLE" && st.jog === false,
-    "reset gesture failed: " + JSON.stringify(st),
-  );
+  assert(st.state === "IDLE", "reset gesture failed: " + JSON.stringify(st));
+  assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs on after reset");
   baseline(env);
 });
 
-test("rogue direct Switch.Set while IDLE => FAULT on next press; cmd=reset recovers", () => {
+test("rogue direct Switch.Set while IDLE => FAULT; cmd=reset recovers", () => {
   const env = boot();
   env.setOutputExternal(UP, true); // HomeKit bypass simulation
   env.advance(100);
   let st = env.http("");
-  assert(
-    st.state === "FAULT",
-    "unexpected ON did not FAULT: " + JSON.stringify(st),
-  );
+  assert(st.state === "FAULT", "unexpected ON did not FAULT: " + JSON.stringify(st));
   assert(!env.outputs[UP], "FAULT did not force outputs off");
-  env.tap(DOWN, 100);
-  env.advance(2000);
+  env.press(DOWN);
+  env.advance(500);
   assert(!env.outputs[DOWN], "FAULT lockout did not hold");
+  env.release(DOWN);
   env.http("cmd=reset");
   env.advance(500);
-  env.tap(DOWN, 100);
-  env.advance(1200);
-  assert(env.outputs[DOWN], "no trip after reset");
+  env.press(DOWN);
+  env.advance(500);
+  assert(env.outputs[DOWN], "no run after reset");
+  env.release(DOWN);
+  env.advance(1000);
   baseline(env);
 });
 
@@ -248,9 +206,8 @@ test("terminal declaration burst stays within RPC limit", () => {
   const env = boot();
   env.http("set=bottom");
   env.advance(100);
-  env.tap(UP, 100);
-  env.advance(1100);
-  env.advance(60000); // auto-off at top: KVS x2 + webhooks x2 + Switch.Set
+  dbl(env, UP);
+  env.advance(60000); // auto-off at top: KVS + webhooks + Switch.Set burst
   baseline(env); // throws if >5 concurrent
   assert(env.http("").pos === "top", "trip did not complete");
 });
@@ -259,16 +216,14 @@ test("stop racing auto-off does not strand the stopping flag", () => {
   const env = boot();
   env.http("set=bottom");
   env.advance(100);
-  env.tap(UP, 100);
-  env.advance(1100);
-  env.advance(54995); // just before 55s auto-off
+  dbl(env, UP);
+  env.advance(54300); // just before 55 s auto-off (trip started ~600ms in)
   env.press(UP); // stop press lands as auto-off fires
   env.advance(50);
   env.release(UP);
-  env.advance(2000);
-  // next trip must still complete & declare its floor
-  env.tap(DOWN, 100);
-  env.advance(1100 + 46000);
+  env.advance(2500);
+  dbl(env, DOWN); // follow-up trip must still complete & declare its floor
+  env.advance(50000);
   const st = env.http("");
   assert(
     st.pos === "bottom",
@@ -308,16 +263,12 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     }
     if (held[UP]) env.release(UP);
     if (held[DOWN]) env.release(DOWN);
-    env.advance(70000); // let everything settle (max auto-off + slack)
+    env.advance(70000); // settle: max auto-off + slack
 
     let st = env.http("");
     assert(
       st.state === "IDLE",
-      "iter " +
-        iter +
-        ": stuck in " +
-        st.state +
-        " hist=" +
+      "iter " + iter + ": stuck in " + st.state + " hist=" +
         JSON.stringify(env.http("cmd=hist").hist),
     );
     assert(
@@ -325,41 +276,16 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
       "iter " + iter + ": output stuck on",
     );
 
-    // recoverability: exit jog if needed (tap+press also starts a trip)
-    if (st.jog) {
-      const jd = st.pos === "top" ? DOWN : UP;
-      env.tap(jd, 60, 300);
-      env.press(jd);
-      env.advance(300);
-      env.release(jd);
-      env.advance(200);
-      st = env.http("");
-      assert(!st.jog, "iter " + iter + ": tap+press did not exit jog");
-      assert(
-        env.outputs[jd],
-        "iter " + iter + ": jog-exit press did not start travel",
-      );
-      env.advance(60000);
-      st = env.http("");
-      assert(
-        st.state === "IDLE" && !env.outputs[jd],
-        "iter " + iter + ": jog-exit trip did not finish",
-      );
-    } else {
-      const dir = st.pos === "top" ? DOWN : UP;
-      env.tap(dir, 100);
-      env.advance(1200);
-      assert(
-        env.outputs[dir],
-        "iter " + iter + ": recovery press did not start a trip",
-      );
-      env.advance(60000);
-      st = env.http("");
-      assert(
-        st.state === "IDLE" && !env.outputs[dir],
-        "iter " + iter + ": recovery trip did not finish",
-      );
-    }
+    // recoverability: a double-press must run a latched trip to a floor
+    const dir = st.pos === "top" ? DOWN : UP;
+    dbl(env, dir);
+    assert(env.outputs[dir], "iter " + iter + ": double-press did not latch");
+    env.advance(60000);
+    st = env.http("");
+    assert(
+      st.state === "IDLE" && !env.outputs[dir],
+      "iter " + iter + ": recovery trip did not finish",
+    );
     baseline(env);
   }
 });
@@ -371,10 +297,7 @@ test("fuzz: literal Konami code (UU DD UD UD) mash", () => {
   env.advance(70000);
   const st = env.http("");
   assert(st.state === "IDLE", "Konami code stuck the arbiter in " + st.state);
-  assert(
-    !env.outputs[UP] && !env.outputs[DOWN],
-    "Konami code left an output on",
-  );
+  assert(!env.outputs[UP] && !env.outputs[DOWN], "Konami code left an output on");
   baseline(env);
 });
 

@@ -10,7 +10,7 @@
 var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  TAP_MS: 400, // jog: press shorter than this = tap (arms the jog-exit press)
+  TAP_MS: 400, // press shorter than this = tap (arms the double-press)
   DBL_MS: 1000, // gesture window: 2nd press within 1 s of the previous
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
@@ -30,9 +30,10 @@ var DIR_NAME = ["UP", "DOWN"];
 var S = {
   state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  jog: false, // ON: two quick presses (normal); OFF: tap+press (also starts travel)
-  latched: false, // RUNNING: true = full trip, false = hold-to-run (jog)
-  lastTapDir: null, // jog-exit arming: last quick tap in jog mode
+  jog: false, // retained for status compat; always false in the modeless rev
+  latched: false, // RUNNING: true = latched trip, false = hold-to-run
+  forceLatch: false, // double-press detected at request time: latch this trip
+  lastTapDir: null, // last quick tap / stop press: arms the double-press
   lastTapTs: 0,
   pressTs: 0,
   runOnTs: 0, // when the output actually energized (dead reckoning)
@@ -218,7 +219,7 @@ function cooldown() {
     guard("cdTimer", function () {
       S.cdTimer = null;
       S.state = "IDLE";
-      log("re-armed" + (S.jog ? " (jog mode)" : ""));
+      log("re-armed");
     }),
   );
 }
@@ -238,7 +239,7 @@ function hardReset(source) {
   bothOff();
   S.state = "IDLE";
   S.dir = null;
-  S.jog = false;
+  S.forceLatch = false;
   S.latched = false;
   S.lastTapDir = null;
   S.stopping = false;
@@ -268,14 +269,14 @@ function request(dir, source) {
     return "fault";
   }
 
-  if (source === "input")
-    log(
-      "press " + DIR_NAME[dir] + " (" + S.state + (S.jog ? ", jog" : "") + ")",
-    );
+  if (source === "input") log("press " + DIR_NAME[dir] + " (" + S.state + ")");
 
   if (S.state === "RUNNING") {
-    // any press during a trip = stop (mode unchanged); next press = new trip
-    stopTrip(DIR_NAME[dir] + " press during trip, " + source);
+    // any press during a run = stop (never reverse); quick follow-up press
+    // in the pressed direction = latched "remaining travel"
+    S.lastTapDir = source === "input" ? dir : null;
+    S.lastTapTs = Date.now();
+    stopTrip(DIR_NAME[dir] + " press during run, " + source);
     return "stopped";
   }
 
@@ -286,36 +287,24 @@ function request(dir, source) {
       cooldown();
       return "conflict";
     }
-    if (!S.jog && source === "input") {
-      // two quick presses = jog mode ON (trip cancelled, no motion)
-      clearTimers();
-      S.state = "IDLE";
-      S.dir = null;
-      S.jog = true;
-      log("double-press — jog mode ON");
-      return "jog-on";
-    }
     return "duplicate";
   }
 
-  // jog: tap then press within the window = jog OFF + full travel that direction
-  var jogExit =
-    S.jog &&
+  // double-press: 2nd press within the window = latched full travel that way
+  var dbl =
     source === "input" &&
     S.lastTapDir === dir &&
     Date.now() - S.lastTapTs <= CFG.DBL_MS;
-  if (jogExit) {
-    S.lastTapDir = null;
-    S.jog = false;
-    log("double-press — jog OFF, full travel " + DIR_NAME[dir]);
-    if (S.state === "COOLDOWN") {
-      // the 2nd press usually lands in the post-tap cooldown; safe to cut short
-      clearTimers();
-      S.state = "IDLE";
-    }
+
+  if (S.state === "COOLDOWN") {
+    // the 2nd press usually lands in the post-tap/stop cooldown; safe to cut
+    // short for a same-direction latch
+    if (!dbl) return "busy";
+    clearTimers();
+    S.state = "IDLE";
   }
 
-  if (S.state !== "IDLE") return "busy"; // COOLDOWN
+  if (S.state !== "IDLE") return "busy";
 
   if (outOn(UP) || outOn(DOWN)) {
     fault("output ON while believed IDLE");
@@ -329,13 +318,11 @@ function request(dir, source) {
 
   S.state = "PENDING";
   S.dir = dir;
+  S.forceLatch = dbl;
   S.lastTapDir = null;
-  // normal-mode physical press waits out the gesture window; jog-exit, jog
-  // and HTTP use the short arbitration window only
-  var wait = !S.jog && source === "input" && !jogExit ? CFG.DBL_MS : CFG.ARB_MS;
-  log(DIR_NAME[dir] + " pending (" + source + ")");
+  log(DIR_NAME[dir] + " pending (" + source + ")" + (dbl ? " [double-press]" : ""));
   S.arbTimer = Timer.set(
-    wait,
+    CFG.ARB_MS,
     false,
     guard("arbTimer", function () {
       S.arbTimer = null;
@@ -353,8 +340,9 @@ function startTrip(source) {
   // RUNNING before energizing: a press landing between here and relay closure
   // is treated as "press during trip" (stop), never a second acceptance.
   S.state = "RUNNING";
-  // Jog-mode physical press = hold-to-run; everything else = latched full trip.
-  S.latched = !(S.jog && source === "input");
+  // Physical single press = hold-to-run; double-press and HTTP = latched trip.
+  S.latched = S.forceLatch || source !== "input";
+  S.forceLatch = false;
   S.pressTs = Date.now();
   S.runOnTs = Date.now();
   S.lastRunDir = S.dir;
@@ -373,8 +361,8 @@ function release(dir) {
     Timer.clear(S.resetTimer);
     S.resetTimer = null;
   }
-  if (S.state === "PENDING" && dir === S.dir && S.jog) {
-    // jog: released inside the arbitration window — no motion, arms jog-exit
+  if (S.state === "PENDING" && dir === S.dir && !S.forceLatch) {
+    // released inside the arbitration window — no motion, arms the double
     clearTimers();
     S.state = "IDLE";
     S.dir = null;
@@ -385,7 +373,7 @@ function release(dir) {
   }
   if (S.state === "RUNNING" && !S.latched && dir === S.dir) {
     if (Date.now() - S.pressTs < CFG.TAP_MS) {
-      // quick tap (short nudge): arms the jog-exit second press
+      // quick tap (short nudge): arms the double-press
       S.lastTapDir = dir;
       S.lastTapTs = Date.now();
       stopTrip(
@@ -393,7 +381,7 @@ function release(dir) {
       );
     } else {
       S.lastTapDir = null;
-      stopTrip("jog release"); // stay in jog mode
+      stopTrip("hold release");
     }
   }
 }
@@ -474,7 +462,7 @@ Shelly.addStatusHandler(
   }),
 );
 
-// HomeKit/remote entry: http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|reset|jog|hist
+// HomeKit/remote entry: http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|reset|hist
 HTTPServer.registerEndpoint("lift", function (req, res) {
   var q = req.query ? req.query : "";
   var result = "status";
@@ -486,14 +474,6 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
         result = "stopped";
       } else {
         result = "not-running";
-      }
-    } else if (q.indexOf("cmd=jog") !== -1) {
-      if (S.state === "IDLE" || S.state === "COOLDOWN") {
-        S.jog = !S.jog;
-        log("jog mode " + (S.jog ? "ON" : "OFF") + " (http)");
-        result = S.jog ? "jog-on" : "jog-off";
-      } else {
-        result = "jog-refused";
       }
     } else if (q.indexOf("cmd=reset") !== -1) {
       hardReset("http");
@@ -527,7 +507,7 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     result: result,
     state: S.state,
     dir: S.dir === null ? null : DIR_NAME[S.dir],
-    jog: S.jog,
+    latched: S.latched,
     pos: S.pos,
     est: S.est === null ? null : Math.round(S.est * 100) / 100,
   };
@@ -541,7 +521,7 @@ function init() {
   bothOff(); // fail-safe regardless of pre-boot state
   S.state = "IDLE";
   S.dir = null;
-  S.jog = false;
+  S.forceLatch = false;
   S.latched = false;
 
   // est restore chained after pos restore: its fallback derives from S.pos
