@@ -54,7 +54,10 @@ function dbl(env, dir) {
 test("boot: outputs off, IDLE, normal mode", () => {
   const env = boot();
   const st = env.http("");
-  assert(st.state === "IDLE" && !st.jog, "not idle/normal: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE" && !st.jog,
+    "not idle/normal: " + JSON.stringify(st),
+  );
   assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs not off");
   baseline(env);
 });
@@ -166,7 +169,10 @@ test("jog: opposite press = two presses = jog OFF + stop (direction-agnostic)", 
   env.advance(2000);
   assert(!env.outputs[UP], "jog exit press started motion (it must not)");
   const st = env.http("");
-  assert(st.jog === false, "jog not exited by two presses: " + JSON.stringify(st));
+  assert(
+    st.jog === false,
+    "jog not exited by two presses: " + JSON.stringify(st),
+  );
   env.release(DOWN);
   env.release(UP);
   env.advance(1000);
@@ -182,7 +188,10 @@ test("quick opposite press within the chain window = jog toggle, NOT reverse", (
   env.advance(1000);
   const st = env.http("");
   assert(!env.outputs[DOWN] && !env.outputs[UP], "motion after quick opposite");
-  assert(st.jog === true, "quick opposite did not toggle jog: " + JSON.stringify(st));
+  assert(
+    st.jog === true,
+    "quick opposite did not toggle jog: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -193,7 +202,10 @@ test("mixed-direction triple = calibration (only press count matters)", () => {
   env.tap(UP, 60);
   env.advance(2000);
   const st = env.http("");
-  assert(st.calib === true, "mixed triple did not calibrate: " + JSON.stringify(st));
+  assert(
+    st.calib === true,
+    "mixed triple did not calibrate: " + JSON.stringify(st),
+  );
   assert(env.outputs[UP], "calibration ride not running");
   env.advance(60000);
   assert(env.http("").pos === "top", "calibration did not complete");
@@ -215,7 +227,10 @@ test("triple same-dir = calibration (via transient jog), exits to normal at top"
   env.advance(60000);
   st = env.http("");
   assert(
-    st.calib === false && st.jog === false && st.pos === "top" && st.pct === 100,
+    st.calib === false &&
+      st.jog === false &&
+      st.pos === "top" &&
+      st.pct === 100,
     "calibration did not complete to normal: " + JSON.stringify(st),
   );
   env.advance(CHAIN_GAP);
@@ -242,9 +257,9 @@ test("calibration lockout escape: hold one paddle 3 s", () => {
   baseline(env);
 });
 
-test("rogue direct Switch.Set => FAULT; hold escape clears", () => {
+test("UNEXPLAINED output ON (no user source) => FAULT; hold escape clears", () => {
   const env = boot();
-  env.setOutputExternal(UP, true);
+  env.setOutputExternal(UP, true, "init"); // no deliberate source: rogue
   env.advance(2500);
   assert(env.http("").state === "FAULT", "rogue output did not FAULT");
   assert(!env.outputs[UP], "FAULT did not force outputs off");
@@ -256,6 +271,159 @@ test("rogue direct Switch.Set => FAULT; hold escape clears", () => {
   go(env, DOWN);
   assert(env.outputs[DOWN], "no travel after escape");
   env.advance(50000);
+  baseline(env);
+});
+
+test("management-UI ON is ADOPTED as a governed run", () => {
+  const env = boot();
+  env.http("set=bottom");
+  env.advance(200);
+  env.setOutputExternal(UP, true, "ui"); // user toggles O1 in the web UI
+  env.advance(300);
+  let st = env.http("");
+  assert(
+    st.state === "RUNNING" && st.dir === "UP",
+    "UI run not adopted: " + JSON.stringify(st),
+  );
+  // adopted run obeys arbiter rules: double-press stops it
+  env.tap(UP, 80, 300);
+  env.tap(UP, 80);
+  env.advance(500);
+  assert(!env.outputs[UP], "adopted run did not obey double-press stop");
+  assert(env.http("").state !== "FAULT", "adoption faulted");
+  baseline(env);
+});
+
+test("adopted run completes via Auto-Off and declares the floor", () => {
+  const env = boot();
+  env.http("set=bottom");
+  env.advance(200);
+  env.setOutputExternal(UP, true, "ui");
+  env.advance(60000); // firmware Auto-Off still backs the external run
+  const st = env.http("");
+  assert(
+    st.state === "IDLE" && st.pos === "top" && st.pct === 100,
+    "adopted run did not complete: " + JSON.stringify(st),
+  );
+  baseline(env);
+});
+
+test("external UI OFF mid-run = stop, NOT a floor declaration", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  go(env, DOWN);
+  env.advance(20000); // mid-shaft
+  env.setOutputExternal(DOWN, false, "ui"); // user switches it off in the UI
+  env.advance(1000);
+  const st = env.http("");
+  assert(
+    st.state === "IDLE",
+    "external off did not settle: " + JSON.stringify(st),
+  );
+  assert(
+    st.pos === "mid",
+    "external off falsely declared a floor: " + JSON.stringify(st),
+  );
+  assert(
+    st.est > 0.3 && st.est < 0.8,
+    "est wrong after external off: " + st.est,
+  );
+  baseline(env);
+});
+
+test("external ON opposite a running direction still FAULTs", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  go(env, DOWN);
+  env.advance(5000);
+  env.setOutputExternal(UP, true, "ui"); // conflict: never adopt
+  env.advance(500);
+  const st = env.http("");
+  assert(st.state === "FAULT", "conflicting external ON did not FAULT");
+  assert(
+    !env.outputs[UP] && !env.outputs[DOWN],
+    "outputs on after conflict FAULT",
+  );
+  env.bothOnViolations = 0; // the injected conflict IS the expected overlap
+  baseline(env);
+});
+
+test("S3 limit feedback ends the run early and declares the floor", () => {
+  const env = createEnv();
+  env.limitEnabled = true; // input:2 wired
+  env.load();
+  env.advance(500);
+  env.http("set=top");
+  env.advance(200);
+  go(env, DOWN);
+  env.advance(20000); // platform hits the physical limit early
+  env.press(2); // S3 fires
+  env.advance(1000);
+  env.release(2);
+  const st = env.http("");
+  assert(!env.outputs[DOWN], "S3 did not end the command");
+  assert(
+    st.pos === "bottom" && st.pct === 0,
+    "S3 did not declare the floor: " + JSON.stringify(st),
+  );
+  env.advance(2000);
+  assert(env.http("").state === "IDLE", "not idle after S3 stop");
+  baseline(env);
+});
+
+test("script restart restores position/estimate from KVS, no motion", () => {
+  const env = boot();
+  env.http("set=bottom");
+  env.advance(200);
+  go(env, UP);
+  env.advance(60000); // at top, persisted
+  const reborn = createEnv();
+  reborn.kvs = env.kvs; // same device KVS across the restart
+  reborn.load();
+  reborn.advance(1000);
+  const st = reborn.http("");
+  assert(
+    st.state === "IDLE" && st.pos === "top" && st.pct === 100,
+    "restart did not restore state: " + JSON.stringify(st),
+  );
+  assert(
+    !reborn.outputs[UP] && !reborn.outputs[DOWN],
+    "restart energized an output",
+  );
+  baseline(reborn);
+});
+
+test("failed reverse auto-start is logged, never silent", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  go(env, DOWN);
+  env.advance(5000);
+  env.inputs[DOWN] = true; // stuck opposite contact (level only, no event)
+  env.tap(UP, 80); // reversal intent — zero cooldown fires the reverse fast
+  env.advance(2000);
+  assert(!env.outputs[UP], "reverse started despite stuck opposite input");
+  const hist = env.http("cmd=hist").hist.join(" | ");
+  assert(
+    hist.indexOf("reverse did not start") !== -1,
+    "reverse failure not logged: " + hist,
+  );
+  env.inputs[DOWN] = false;
+  baseline(env);
+});
+
+test("blackbox persists and never exceeds its cap", () => {
+  const env = boot();
+  go(env, UP);
+  env.advance(60000);
+  const blackbox = env.kvs["lift.blackbox"];
+  assert(
+    typeof blackbox === "string" && blackbox.length > 0,
+    "blackbox not persisted",
+  );
+  assert(blackbox.length <= 250, "blackbox exceeded cap: " + blackbox.length);
   baseline(env);
 });
 
@@ -277,7 +445,10 @@ test("dead reckoning: jog positioning tracks est; hold to limit declares floor",
   env.release(DOWN);
   env.advance(1000);
   st = env.http("");
-  assert(st.pos === "bottom" && st.pct === 0, "hold to limit not declared: " + JSON.stringify(st));
+  assert(
+    st.pos === "bottom" && st.pct === 0,
+    "hold to limit not declared: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -291,7 +462,10 @@ test("http stop racing auto-off does not strand the stopping flag", () => {
   env.advance(2500);
   go(env, DOWN);
   env.advance(50000);
-  assert(env.http("").pos === "bottom", "follow-up travel did not declare floor");
+  assert(
+    env.http("").pos === "bottom",
+    "follow-up travel did not declare floor",
+  );
   baseline(env);
 });
 
@@ -345,10 +519,19 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     let st = env.http("");
     assert(
       st.state === "IDLE" && !st.calib,
-      "iter " + iter + ": stuck in " + st.state + " calib=" + st.calib +
-        " hist=" + JSON.stringify(env.http("cmd=hist").hist),
+      "iter " +
+        iter +
+        ": stuck in " +
+        st.state +
+        " calib=" +
+        st.calib +
+        " hist=" +
+        JSON.stringify(env.http("cmd=hist").hist),
     );
-    assert(!env.outputs[UP] && !env.outputs[DOWN], "iter " + iter + ": output stuck on");
+    assert(
+      !env.outputs[UP] && !env.outputs[DOWN],
+      "iter " + iter + ": output stuck on",
+    );
 
     // recoverability: exit jog if the mash left it on, then travel to a floor
     if (st.jog) {
@@ -365,7 +548,10 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     assert(env.outputs[dir], "iter " + iter + ": recovery press did not run");
     env.advance(60000);
     st = env.http("");
-    assert(st.state === "IDLE" && !env.outputs[dir], "iter " + iter + ": recovery run did not finish");
+    assert(
+      st.state === "IDLE" && !env.outputs[dir],
+      "iter " + iter + ": recovery run did not finish",
+    );
     baseline(env);
   }
 });
@@ -376,7 +562,10 @@ test("fuzz: literal Konami code (UU DD UD UD) mash", () => {
   for (const id of seqs) env.tap(id, 60, 120);
   env.advance(130000);
   const st = env.http("");
-  assert(st.state === "IDLE" && !st.calib, "Konami stuck the arbiter: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE" && !st.calib,
+    "Konami stuck the arbiter: " + JSON.stringify(st),
+  );
   assert(!env.outputs[UP] && !env.outputs[DOWN], "Konami left an output on");
   baseline(env);
 });

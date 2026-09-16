@@ -39,14 +39,14 @@ declare const Shelly: {
 
 interface ShellyEvent {
   component: string;
-  info?: { event: string; state?: boolean; id: number };
+  info?: { event: string; state?: boolean; id: number; };
 }
 
 interface ShellyStatus {
   name: string;
   id: number;
   component: string;
-  delta?: { output?: boolean; source?: string };
+  delta?: { output?: boolean; source?: string; };
 }
 
 declare const Timer: {

@@ -10,37 +10,39 @@
 // O1 (switch:0) = J6 UP, O2 (switch:1) = J6 DOWN.
 // S1 (input:0)  = any physical UP request, S2 (input:1) = any physical DOWN.
 //
-// GESTURES (rev 10):
+// GESTURES (rev 12) — press count within 3 s of the chain's first press,
+// direction-agnostic:
 //   idle press            -> latched full travel (energized immediately)
 //   opposite press in run -> REVERSE: stop, dead-time, full travel other way
-//   same-dir 2nd press    -> toggle JOG MODE (stops the run on entry)
-//     (chain: presses within 3 s of the chain's FIRST press, same direction)
-//   same-dir 3rd press    -> CALIBRATION ride (full UP, paddle locked)
+//   2nd press             -> toggle JOG MODE (stops the run on entry)
+//   3rd press             -> CALIBRATION ride (full UP, paddle locked)
 //   jog mode              -> hold-to-run; double-press exits back to normal
 //   hold paddle 3 s       -> lockout escape (FAULT/calibration only)
+//   external Switch.Set   -> ADOPTED as a governed run (UI/RPC = just another
+//                            input); conflicts and unexplained outputs FAULT
 //
 // ARCHITECTURE RULE (hard-won): mJS has a tiny call stack and fw 2.0.0
 // clobbers params of Shelly.call dispatched in the same tick. Handlers and
 // helpers may ONLY mutate memory; ALL RPC I/O is emitted by ONE flat repeating
 // timer (the IoQueue tick), at most one call per tick. No class inheritance,
 // no accessors, no spread: those emit ES5 helpers the device cannot run.
-var UP = 0;
-var DOWN = 1;
-var DIR_NAME = ["UP", "DOWN"];
+// `const enum` only — it inlines to literals at compile time.
+var DIRECTION_NAME = ["UP", "DOWN"];
 var CFG = {
-    COOLDOWN_MS: 0, // stop -> reverse/re-arm dead-time
-    DBL_MS: 3000, // gesture chain: presses within 3 s of the chain's first press
+    COOLDOWN_MS: 0, // stop -> reverse/re-arm dead-time (tick-confirmed re-arm)
+    CHAIN_MS: 3000, // gesture chain: presses within 3 s of the chain's first press
     TICK_MS: 25, // I/O drain tick
     TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
     TRAVEL_DOWN_MS: 45000,
-    EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
+    ESTIMATE_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
     OFF_GRACE_MS: 2000, // commanded-OFF may lag this long before it's "rogue"
     RESET_HOLD_MS: 3000, // lockout-escape hold duration
-    LIMIT_IN: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
-    POS_KEY: "lift.pos",
-    EST_KEY: "lift.est",
-    LOG_KEY: "lift.blackbox",
-    HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
+    LIMIT_INPUT: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
+    POSITION_KEY: "lift.pos",
+    ESTIMATE_KEY: "lift.est",
+    BLACKBOX_KEY: "lift.blackbox",
+    WEBHOOK_KEY: "lift.hbwebhook", // optional KVS override for the webhook base
+    WEBHOOK_BASE: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
 };
 // ---------------------------------------------------------------------------
 // IoQueue — the ONLY place Shelly.call happens. Everything else raises
@@ -50,134 +52,168 @@ var CFG = {
 // ---------------------------------------------------------------------------
 var IoQueue = /** @class */ (function () {
     function IoQueue() {
-        this.relay = []; // FIFO — relay command order is sacred
-        this.jobs = [];
-        this.dirtyPos = false;
-        this.dirtyEst = false;
-        this.dirtyBB = false;
-        this.whQueue = [];
-        this.inflight = 0;
+        this.relayQueue = []; // FIFO — relay command order is sacred
+        this.oneShotJobs = [];
+        this.positionDirty = false;
+        this.estimateDirty = false;
+        this.blackboxDirty = false;
+        this.webhookQueue = [];
+        this.callsInFlight = 0;
         this.owner = null;
     }
     IoQueue.prototype.attach = function (owner) {
+        var _this = this;
         this.owner = owner;
-        var self = this;
         Timer.set(CFG.TICK_MS, true, function () {
-            self.tick();
-            self.owner.pump(); // re-arm / pending auto-starts
+            _this.tick();
+            _this.owner.pump(); // re-arm / pending auto-starts
         });
     };
     IoQueue.prototype.pushRelay = function (id, on) {
-        this.relay.push({ id: id, on: on, r: 0 });
+        this.relayQueue.push({ id: id, on: on, retries: 0 });
     };
-    IoQueue.prototype.pushJob = function (m, p, cb) {
-        this.jobs.push({ kind: "job", m: m, p: p, cb: cb });
+    IoQueue.prototype.pushOneShot = function (method, params, callback) {
+        this.oneShotJobs.push({ kind: "job" /* JobKind.OneShot */, method: method, params: params, callback: callback });
     };
     IoQueue.prototype.nextJob = function () {
-        var o = this.owner;
-        if (this.relay.length > 0 && this.inflight < 4) {
-            var rc = this.relay.splice(0, 1)[0];
-            return { m: "Switch.Set", p: { id: rc.id, on: rc.on }, kind: "relay", rc: rc };
-        }
-        if (this.inflight >= 2)
-            return null; // headroom below the fw call cap
-        if (this.jobs.length > 0)
-            return this.jobs.splice(0, 1)[0];
-        if (this.dirtyPos) {
-            this.dirtyPos = false;
-            return { m: "KVS.Set", p: { key: CFG.POS_KEY, value: o.pos }, kind: "pos" };
-        }
-        if (this.dirtyEst) {
-            this.dirtyEst = false;
-            var v = "";
-            if (o.est !== null)
-                v = JSON.stringify(o.est);
-            return { m: "KVS.Set", p: { key: CFG.EST_KEY, value: v }, kind: "est" };
-        }
-        if (this.whQueue.length > 0) {
-            var u = this.whQueue.splice(0, 1)[0];
-            return { m: "HTTP.GET", p: { url: u, timeout: 3 }, kind: "wh" };
-        }
-        if (this.dirtyBB) {
-            this.dirtyBB = false;
+        var owner = this.owner;
+        if (this.relayQueue.length > 0 && this.callsInFlight < 4) {
+            var relayCommand = this.relayQueue.splice(0, 1)[0];
             return {
-                m: "KVS.Set",
-                p: { key: CFG.LOG_KEY, value: o.hist.join(" | ").slice(-250) },
-                kind: "bb",
+                kind: "relay" /* JobKind.Relay */,
+                method: "Switch.Set",
+                params: { id: relayCommand.id, on: relayCommand.on },
+                relay: relayCommand,
+            };
+        }
+        if (this.callsInFlight >= 2)
+            return null; // headroom below the fw call cap
+        if (this.oneShotJobs.length > 0)
+            return this.oneShotJobs.splice(0, 1)[0];
+        if (this.positionDirty) {
+            this.positionDirty = false;
+            return {
+                kind: "pos" /* JobKind.PersistPosition */,
+                method: "KVS.Set",
+                params: { key: CFG.POSITION_KEY, value: owner.position },
+            };
+        }
+        if (this.estimateDirty) {
+            this.estimateDirty = false;
+            var serialized = "";
+            if (owner.estimate !== null)
+                serialized = JSON.stringify(owner.estimate);
+            return {
+                kind: "est" /* JobKind.PersistEstimate */,
+                method: "KVS.Set",
+                params: { key: CFG.ESTIMATE_KEY, value: serialized },
+            };
+        }
+        if (this.webhookQueue.length > 0) {
+            var url = this.webhookQueue.splice(0, 1)[0];
+            return { kind: "wh" /* JobKind.Webhook */, method: "HTTP.GET", params: { url: url, timeout: 3 } };
+        }
+        if (this.blackboxDirty) {
+            this.blackboxDirty = false;
+            return {
+                kind: "bb" /* JobKind.PersistBlackbox */,
+                method: "KVS.Set",
+                params: { key: CFG.BLACKBOX_KEY, value: owner.history.join(" | ").slice(-250) },
             };
         }
         return null;
     };
     IoQueue.prototype.tick = function () {
-        var j = this.nextJob();
-        if (j === null)
+        var _this = this;
+        var job = this.nextJob();
+        if (job === null)
             return;
-        var self = this;
-        this.inflight++;
+        this.callsInFlight++;
         try {
-            Shelly.call(j.m, j.p, function (r, ec, em, ud) {
-                self.inflight--;
-                var job = ud;
-                if (ec !== 0 && job.kind === "relay") {
-                    job.rc.r++;
-                    if (job.rc.r <= 2)
-                        self.relay.unshift(job.rc); // idempotent retry
-                    else
-                        self.owner.log("relay failed: " + em + " id=" + job.rc.id);
+            Shelly.call(job.method, job.params, function (result, errorCode, errorMessage, userdata) {
+                _this.callsInFlight--;
+                var finished = userdata;
+                if (errorCode !== 0) {
+                    switch (finished.kind) {
+                        case "relay" /* JobKind.Relay */:
+                            finished.relay.retries++;
+                            if (finished.relay.retries <= 2) {
+                                _this.relayQueue.unshift(finished.relay); // idempotent retry
+                            }
+                            else {
+                                _this.owner.log("relay failed: " + errorMessage + " id=" + finished.relay.id);
+                            }
+                            break;
+                        case "pos" /* JobKind.PersistPosition */:
+                            _this.positionDirty = true;
+                            break;
+                        case "est" /* JobKind.PersistEstimate */:
+                            _this.estimateDirty = true;
+                            break;
+                        default:
+                            break; // webhook/blackbox: the next state change re-sends
+                    }
                 }
-                else if (ec !== 0 && job.kind === "pos")
-                    self.dirtyPos = true;
-                else if (ec !== 0 && job.kind === "est")
-                    self.dirtyEst = true;
-                if (job.kind === "job" && job.cb)
-                    job.cb(r, ec, em);
-            }, j);
+                if (finished.kind === "job" /* JobKind.OneShot */ && finished.callback) {
+                    finished.callback(result, errorCode, errorMessage);
+                }
+            }, job);
         }
-        catch (e) {
-            this.inflight--;
-            if (j.kind === "relay")
-                this.relay.unshift(j.rc);
-            else if (j.kind === "job")
-                this.jobs.unshift(j);
-            else if (j.kind === "pos")
-                this.dirtyPos = true;
-            else if (j.kind === "est")
-                this.dirtyEst = true;
-            else if (j.kind === "bb")
-                this.dirtyBB = true;
+        catch (error) {
+            this.callsInFlight--;
+            switch (job.kind) {
+                case "relay" /* JobKind.Relay */:
+                    this.relayQueue.unshift(job.relay);
+                    break;
+                case "job" /* JobKind.OneShot */:
+                    this.oneShotJobs.unshift(job);
+                    break;
+                case "pos" /* JobKind.PersistPosition */:
+                    this.positionDirty = true;
+                    break;
+                case "est" /* JobKind.PersistEstimate */:
+                    this.estimateDirty = true;
+                    break;
+                case "bb" /* JobKind.PersistBlackbox */:
+                    this.blackboxDirty = true;
+                    break;
+                case "wh" /* JobKind.Webhook */:
+                    break; // dropped; the next position change re-sends
+            }
         }
     };
     return IoQueue;
 }());
 // ---------------------------------------------------------------------------
-// Gestures — classifies physical presses into intents. Chain = same-direction
-// presses within DBL_MS of the chain's FIRST press.
+// Gestures — classifies physical presses into intents. Direction-agnostic:
+// only the NUMBER of presses within CHAIN_MS of the chain's first press counts.
 // ---------------------------------------------------------------------------
 var Gestures = /** @class */ (function () {
     function Gestures() {
-        this.n = 0;
-        this.startTs = 0;
+        this.pressCount = 0;
+        this.chainStartedAt = 0;
     }
-    // direction-agnostic: only the NUMBER of presses within the window matters
     Gestures.prototype.classify = function () {
-        if (Date.now() - this.startTs <= CFG.DBL_MS) {
-            this.n++;
+        if (Date.now() - this.chainStartedAt <= CFG.CHAIN_MS) {
+            this.pressCount++;
         }
         else {
-            this.n = 1;
-            this.startTs = Date.now();
+            this.pressCount = 1;
+            this.chainStartedAt = Date.now();
         }
-        if (this.n === 3) {
-            this.reset();
-            return { gesture: "calibrate", n: 3 };
+        switch (this.pressCount) {
+            case 3:
+                this.reset();
+                return { gesture: "calibrate" /* GestureKind.Calibrate */, pressCount: 3 };
+            case 2:
+                return { gesture: "jogToggle" /* GestureKind.JogToggle */, pressCount: 2 };
+            default:
+                return { gesture: "run" /* GestureKind.Run */, pressCount: this.pressCount };
         }
-        if (this.n === 2)
-            return { gesture: "jogToggle", n: 2 };
-        return { gesture: "run", n: 1 };
     };
     Gestures.prototype.reset = function () {
-        this.n = 0;
-        this.startTs = 0;
+        this.pressCount = 0;
+        this.chainStartedAt = 0;
     };
     return Gestures;
 }());
@@ -187,336 +223,356 @@ var Gestures = /** @class */ (function () {
 // ---------------------------------------------------------------------------
 var LiftArbiter = /** @class */ (function () {
     function LiftArbiter() {
-        this.state = "IDLE";
-        this.dir = null;
-        this.jog = false; // hold-to-run mode; toggled by same-dir double-press
-        this.calib = false; // calibration ride: paddle ignored until Auto-Off
-        this.calibPending = false;
-        this.nextDir = null; // reversal target after cooldown
-        this.runOnTs = 0;
-        this.lastRunDir = null;
-        this.onPending = null; // commanded-ON echo still in flight
-        this.cmd = [false, false];
-        this.offTs = [0, 0];
-        this.est = null;
-        this.stopping = false;
+        this.state = "IDLE" /* MachineState.Idle */;
+        this.direction = null;
+        this.jogMode = false; // hold-to-run mode; toggled by double-press
+        this.calibrating = false; // calibration ride: paddle ignored until Auto-Off
+        this.calibrationPending = false;
+        this.reverseTo = null; // reversal target after cooldown
+        this.runStartedAt = 0;
+        this.lastRunDirection = null;
+        this.expectedOnEcho = null; // commanded-ON echo still in flight
+        this.commandedOn = [false, false];
+        this.offCommandedAt = [0, 0];
+        this.estimate = null; // 0=bottom..1=top; null until known
+        this.expectingOffEcho = false; // we commanded OFF; swallow the resulting event
         this.cooldownUntil = 0; // re-arm gate; the tick promotes COOLDOWN->IDLE
-        this.resetTimer = null;
-        this.holdTimer = null;
-        this.limitFb = false;
-        this.hist = [];
-        this.pos = "unknown";
+        this.bothHeldTimer = null;
+        this.holdEscapeTimer = null;
+        this.limitFeedbackActive = false;
+        this.history = [];
+        this.position = "unknown" /* Position.Unknown */;
         this.io = new IoQueue();
         this.gestures = new Gestures();
     }
     // ---- logging / persistence signals ----
-    LiftArbiter.prototype.log = function (msg) {
-        print("[lift] " + msg);
-        this.hist.push(Math.round(Date.now() / 1000) + " " + msg);
-        if (this.hist.length > 15)
-            this.hist.splice(0, 1);
-        this.io.dirtyBB = true;
+    LiftArbiter.prototype.log = function (message) {
+        print("[lift] " + message);
+        this.history.push(Math.round(Date.now() / 1000) + " " + message);
+        if (this.history.length > 15)
+            this.history.splice(0, 1);
+        this.io.blackboxDirty = true;
     };
-    LiftArbiter.prototype.guard = function (name, fn) {
-        var self = this;
+    LiftArbiter.prototype.guard = function (name, handler) {
+        var _this = this;
         return function (a, b, c, d) {
             try {
-                fn(a, b, c, d);
+                handler(a, b, c, d);
             }
-            catch (e) {
+            catch (error) {
                 try {
-                    self.fault("exception in " + name + ": " + e.message);
+                    _this.fault("exception in " + name + ": " + error.message);
                 }
-                catch (e2) {
-                    self.bothOff(); // last resort
+                catch (secondaryError) {
+                    _this.bothOff(); // last resort
                 }
             }
         };
     };
-    LiftArbiter.prototype.setOut = function (id, on) {
-        this.cmd[id] = on;
+    LiftArbiter.prototype.setOutput = function (id, on) {
+        this.commandedOn[id] = on;
         if (!on)
-            this.offTs[id] = Date.now();
+            this.offCommandedAt[id] = Date.now();
         this.io.pushRelay(id, on);
     };
     LiftArbiter.prototype.bothOff = function () {
-        this.setOut(UP, false);
-        this.setOut(DOWN, false);
+        this.setOutput(0 /* Direction.Up */, false);
+        this.setOutput(1 /* Direction.Down */, false);
     };
-    LiftArbiter.prototype.outOn = function (id) {
-        var st = Shelly.getComponentStatus("switch:" + id);
-        return st !== null && st.output === true;
+    LiftArbiter.prototype.outputOn = function (id) {
+        var status = Shelly.getComponentStatus("switch:" + id);
+        return status !== null && status.output === true;
     };
-    LiftArbiter.prototype.inOn = function (id) {
-        var st = Shelly.getComponentStatus("input:" + id);
-        return st !== null && st.state === true;
+    LiftArbiter.prototype.inputOn = function (id) {
+        var status = Shelly.getComponentStatus("input:" + id);
+        return status !== null && status.state === true;
     };
-    LiftArbiter.prototype.rogueOn = function () {
-        for (var i = UP; i <= DOWN; i++) {
-            var d = i;
-            if (this.outOn(d) && !this.cmd[d] && Date.now() - this.offTs[d] > CFG.OFF_GRACE_MS)
+    LiftArbiter.prototype.opposite = function (id) {
+        return id === 0 /* Direction.Up */ ? 1 /* Direction.Down */ : 0 /* Direction.Up */;
+    };
+    // physically ON with no command intent and no recent OFF still landing
+    LiftArbiter.prototype.rogueOutputOn = function () {
+        for (var id = 0 /* Direction.Up */; id <= 1 /* Direction.Down */; id++) {
+            var direction = id;
+            if (this.outputOn(direction) &&
+                !this.commandedOn[direction] &&
+                Date.now() - this.offCommandedAt[direction] > CFG.OFF_GRACE_MS) {
                 return true;
+            }
         }
         return false;
     };
-    LiftArbiter.prototype.setPos = function (p) {
-        if (this.pos === p)
+    LiftArbiter.prototype.setPosition = function (position) {
+        if (this.position === position)
             return;
-        this.pos = p;
-        this.log("position: " + p);
-        this.io.dirtyPos = true;
-        this.io.whQueue = [
-            CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (p === "top"),
-            CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (p === "bottom"),
-        ];
+        this.position = position;
+        this.log("position: " + position);
+        this.io.positionDirty = true;
+        this.pushPositionSensors();
     };
-    LiftArbiter.prototype.setEst = function (e) {
-        this.est = e;
-        this.io.dirtyEst = true;
+    // append (not replace): a queued FAULT alert must never be dropped
+    LiftArbiter.prototype.pushPositionSensors = function () {
+        this.io.webhookQueue.push(CFG.WEBHOOK_BASE + "/?accessoryId=lift-top&state=" + (this.position === "top" /* Position.Top */), CFG.WEBHOOK_BASE + "/?accessoryId=lift-bottom&state=" + (this.position === "bottom" /* Position.Bottom */));
     };
-    LiftArbiter.prototype.updateEst = function (dirId, dtMs) {
-        if (this.est === null || dtMs <= 0)
+    LiftArbiter.prototype.pushFaultAlert = function (on) {
+        this.io.webhookQueue.push(CFG.WEBHOOK_BASE + "/?accessoryId=lift-fault&state=" + on);
+    };
+    LiftArbiter.prototype.setEstimate = function (estimate) {
+        this.estimate = estimate;
+        this.io.estimateDirty = true;
+    };
+    LiftArbiter.prototype.integrateRunTime = function (direction, elapsedMs) {
+        if (this.estimate === null || elapsedMs <= 0)
             return;
-        var d = dirId === UP ? dtMs / CFG.TRAVEL_UP_MS : -dtMs / CFG.TRAVEL_DOWN_MS;
-        var e = this.est + d;
-        if (e < 0)
-            e = 0;
-        if (e > 1)
-            e = 1;
-        this.setEst(e);
+        var delta = direction === 0 /* Direction.Up */
+            ? elapsedMs / CFG.TRAVEL_UP_MS
+            : -elapsedMs / CFG.TRAVEL_DOWN_MS;
+        this.setEstimate(Math.min(1, Math.max(0, this.estimate + delta)));
     };
-    LiftArbiter.prototype.atTerminal = function (dirId, why) {
-        this.setEst(dirId === UP ? 1 : 0);
-        this.setPos(dirId === UP ? "top" : "bottom");
-        this.log("at " + (dirId === UP ? "top" : "bottom") + " (" + why + ")");
+    // a run reached a terminal for certain (Auto-Off, S3 feedback)
+    LiftArbiter.prototype.atTerminal = function (direction, why) {
+        this.setEstimate(direction === 0 /* Direction.Up */ ? 1 : 0);
+        this.setPosition(direction === 0 /* Direction.Up */ ? "top" /* Position.Top */ : "bottom" /* Position.Bottom */);
+        this.log("at " + (direction === 0 /* Direction.Up */ ? "top" : "bottom") + " (" + why + ")");
     };
-    LiftArbiter.prototype.declareFromEst = function () {
-        if (this.est === null || this.pos !== "mid")
+    // after a stop: dead reckoning may still conclude we reached a floor
+    LiftArbiter.prototype.declareFloorFromEstimate = function () {
+        if (this.estimate === null || this.position !== "mid" /* Position.Mid */)
             return;
-        if (this.est >= 1 - CFG.EST_EDGE)
-            this.atTerminal(UP, "dead reckoning");
-        else if (this.est <= CFG.EST_EDGE)
-            this.atTerminal(DOWN, "dead reckoning");
+        if (this.estimate >= 1 - CFG.ESTIMATE_EDGE)
+            this.atTerminal(0 /* Direction.Up */, "dead reckoning");
+        else if (this.estimate <= CFG.ESTIMATE_EDGE)
+            this.atTerminal(1 /* Direction.Down */, "dead reckoning");
     };
     // ---- state transitions ----
-    LiftArbiter.prototype.clearTimers = function () {
-        this.cooldownUntil = 0;
-    };
     LiftArbiter.prototype.fault = function (reason) {
         this.log("FAULT: " + reason + " — both outputs OFF, lockout (cmd=reset to clear)");
-        this.clearTimers();
+        this.cooldownUntil = 0;
         this.bothOff();
-        this.state = "FAULT";
-        this.dir = null;
-        this.calib = false;
-        this.calibPending = false;
-        this.nextDir = null;
+        this.state = "FAULT" /* MachineState.Fault */;
+        this.direction = null;
+        this.calibrating = false;
+        this.calibrationPending = false;
+        this.reverseTo = null;
+        this.runStartedAt = 0; // hygiene: no stale segment survives a fault
+        this.pushFaultAlert(true); // HomeKit-visible alarm
     };
     // COOLDOWN ends when the dead-time (possibly 0) has passed AND the relays
     // are physically OFF with nothing in flight — promoted by the IO tick, so
     // "zero cooldown" is really "as soon as the hardware confirms quiescent".
     LiftArbiter.prototype.cooldown = function () {
-        this.state = "COOLDOWN";
-        this.dir = null;
+        this.state = "COOLDOWN" /* MachineState.Cooldown */;
+        this.direction = null;
         this.cooldownUntil = Date.now() + CFG.COOLDOWN_MS;
     };
     // called every IO tick: re-arm and run any pending auto-start intents
     LiftArbiter.prototype.pump = function () {
-        if (this.state !== "COOLDOWN")
+        if (this.state !== "COOLDOWN" /* MachineState.Cooldown */)
             return;
         if (Date.now() < this.cooldownUntil)
             return;
-        if (this.io.relay.length > 0)
+        if (this.io.relayQueue.length > 0)
             return; // relay commands still queued
-        if (this.outOn(UP) || this.outOn(DOWN))
-            return; // OFF not landed yet
-        this.state = "IDLE";
+        if (this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */))
+            return;
+        this.state = "IDLE" /* MachineState.Idle */;
         this.log("re-armed");
-        if (this.calibPending) {
-            if (this.inOn(UP) || this.inOn(DOWN)) {
+        if (this.calibrationPending) {
+            if (this.inputOn(0 /* Direction.Up */) || this.inputOn(1 /* Direction.Down */)) {
                 this.cooldown(); // the calibration press is still held: wait it out
                 return;
             }
-            this.calibPending = false;
-            this.nextDir = null;
-            this.startCalibTrip();
+            this.calibrationPending = false;
+            this.reverseTo = null;
+            this.startCalibrationRun();
         }
-        else if (this.nextDir !== null) {
-            var d = this.nextDir;
-            this.nextDir = null;
-            var r = this.request(d, "reverse");
-            if (r !== "accepted")
-                this.log("reverse did not start: " + r);
+        else if (this.reverseTo !== null) {
+            var target = this.reverseTo;
+            this.reverseTo = null;
+            var outcome = this.request(target, "reverse" /* RequestSource.Reverse */);
+            if (outcome !== "accepted")
+                this.log("reverse did not start: " + outcome);
         }
     };
-    LiftArbiter.prototype.stopTrip = function (reason) {
+    LiftArbiter.prototype.stopRun = function (reason) {
         this.log("STOP (" + reason + ")");
-        this.stopping = this.outOn(UP) || this.outOn(DOWN);
+        // only expect an off-event if something is actually on (a stop can race Auto-Off)
+        this.expectingOffEcho = this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */);
         this.bothOff();
         this.cooldown();
     };
     LiftArbiter.prototype.hardReset = function (source) {
         this.log("HARD RESET (" + source + ")");
-        this.clearTimers();
+        this.cooldownUntil = 0;
         this.bothOff();
-        this.state = "IDLE";
-        this.dir = null;
-        this.jog = false;
-        this.calib = false;
-        this.calibPending = false;
-        this.nextDir = null;
+        this.state = "IDLE" /* MachineState.Idle */;
+        this.direction = null;
+        this.jogMode = false;
+        this.calibrating = false;
+        this.calibrationPending = false;
+        this.reverseTo = null;
         this.gestures.reset();
-        this.stopping = false;
-        this.onPending = null;
-        this.runOnTs = 0;
+        this.expectingOffEcho = false;
+        this.expectedOnEcho = null;
+        this.runStartedAt = 0;
+        this.pushFaultAlert(false); // clear the HomeKit alarm
     };
-    LiftArbiter.prototype.armResetGesture = function () {
-        if (this.resetTimer !== null)
+    LiftArbiter.prototype.armBothHeldReset = function () {
+        var _this = this;
+        if (this.bothHeldTimer !== null)
             return;
-        var self = this;
-        this.resetTimer = Timer.set(CFG.RESET_HOLD_MS, false, this.guard("resetTimer", function () {
-            self.resetTimer = null;
-            if (self.inOn(UP) && self.inOn(DOWN))
-                self.hardReset("both buttons held");
+        this.bothHeldTimer = Timer.set(CFG.RESET_HOLD_MS, false, this.guard("bothHeldTimer", function () {
+            _this.bothHeldTimer = null;
+            if (_this.inputOn(0 /* Direction.Up */) && _this.inputOn(1 /* Direction.Down */)) {
+                _this.hardReset("both buttons held");
+            }
         }));
     };
     // Rocker paddle can't press both directions; lockout states get a one-button
     // escape. Never armed in normal states.
-    LiftArbiter.prototype.armHoldEscape = function (dir) {
-        if (this.holdTimer !== null)
+    LiftArbiter.prototype.armHoldEscape = function (direction) {
+        var _this = this;
+        if (this.holdEscapeTimer !== null)
             return;
-        var self = this;
-        this.holdTimer = Timer.set(CFG.RESET_HOLD_MS, false, this.guard("holdTimer", function () {
-            self.holdTimer = null;
-            if (self.inOn(dir) && (self.state === "FAULT" || self.calib || self.calibPending))
-                self.hardReset("paddle held in lockout");
+        this.holdEscapeTimer = Timer.set(CFG.RESET_HOLD_MS, false, this.guard("holdEscapeTimer", function () {
+            _this.holdEscapeTimer = null;
+            if (_this.inputOn(direction) &&
+                (_this.state === "FAULT" /* MachineState.Fault */ || _this.calibrating || _this.calibrationPending)) {
+                _this.hardReset("paddle held in lockout");
+            }
         }));
     };
     // ---- calibration ----
     LiftArbiter.prototype.startCalibration = function (source) {
         this.log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
-        this.calib = true;
-        this.jog = false; // calibration always exits to normal mode
-        if (this.state === "RUNNING") {
-            if (this.dir === UP)
+        this.calibrating = true;
+        this.jogMode = false; // calibration always exits to normal mode
+        if (this.state === "RUNNING" /* MachineState.Running */) {
+            if (this.direction === 0 /* Direction.Up */)
                 return "calibrating"; // this run becomes the ride
-            this.calibPending = true;
-            this.stopTrip("calibration: stop before UP ride");
+            this.calibrationPending = true;
+            this.stopRun("calibration: stop before UP ride");
             return "calibrating";
         }
-        if (this.state === "COOLDOWN") {
-            this.calibPending = true;
+        if (this.state === "COOLDOWN" /* MachineState.Cooldown */) {
+            this.calibrationPending = true;
             return "calibrating";
         }
-        this.startCalibTrip();
+        this.startCalibrationRun();
         return "calibrating";
     };
-    LiftArbiter.prototype.startCalibTrip = function () {
-        var r = this.request(UP, "calib");
-        if (r !== "accepted") {
-            this.calib = false;
-            this.calibPending = false;
-            this.log("calibration failed to start: " + r);
+    LiftArbiter.prototype.startCalibrationRun = function () {
+        var outcome = this.request(0 /* Direction.Up */, "calib" /* RequestSource.Calibration */);
+        if (outcome !== "accepted") {
+            this.calibrating = false;
+            this.calibrationPending = false;
+            this.log("calibration failed to start: " + outcome);
         }
     };
     // ---- the single request entry point ----
-    LiftArbiter.prototype.request = function (dir, source) {
-        if (source === "input") {
-            if (this.inOn(UP) && this.inOn(DOWN))
-                this.armResetGesture();
-            if (this.state === "FAULT" || this.calib || this.calibPending)
-                this.armHoldEscape(dir);
+    LiftArbiter.prototype.request = function (direction, source) {
+        if (source === "input" /* RequestSource.Input */) {
+            if (this.inputOn(0 /* Direction.Up */) && this.inputOn(1 /* Direction.Down */))
+                this.armBothHeldReset();
+            if (this.state === "FAULT" /* MachineState.Fault */ || this.calibrating || this.calibrationPending) {
+                this.armHoldEscape(direction);
+            }
         }
-        if (this.state === "FAULT") {
-            this.log("ignored " + DIR_NAME[dir] + " (" + source + "): FAULT lockout");
+        if (this.state === "FAULT" /* MachineState.Fault */) {
+            this.log("ignored " + DIRECTION_NAME[direction] + " (" + source + "): FAULT lockout");
             return "fault";
         }
-        if (this.calib && source === "input") {
-            this.log("ignored " + DIR_NAME[dir] + ": calibration in progress");
+        if (this.calibrating && source === "input" /* RequestSource.Input */) {
+            this.log("ignored " + DIRECTION_NAME[direction] + ": calibration in progress");
             return "calibrating";
         }
-        if (source === "input") {
-            var g = this.gestures.classify();
-            this.log("press " + DIR_NAME[dir] + " " + g.n + " (" + this.state + (this.jog ? ",jog" : "") + ")");
-            if (g.gesture === "calibrate")
+        if (source === "input" /* RequestSource.Input */) {
+            var classified = this.gestures.classify();
+            this.log("press " +
+                DIRECTION_NAME[direction] +
+                " " +
+                classified.pressCount +
+                " (" +
+                this.state +
+                (this.jogMode ? ",jog" : "") +
+                ")");
+            if (classified.gesture === "calibrate" /* GestureKind.Calibrate */)
                 return this.startCalibration(source);
-            if (g.gesture === "jogToggle")
-                return this.toggleJog(dir);
-            if (this.jog)
-                return this.jogPress(dir); // hold-to-run handled on press/release
+            if (classified.gesture === "jogToggle" /* GestureKind.JogToggle */)
+                return this.toggleJogMode();
+            if (this.jogMode)
+                return this.jogPress(direction);
         }
-        if (this.state === "RUNNING") {
-            if (dir !== this.dir) {
+        if (this.state === "RUNNING" /* MachineState.Running */) {
+            if (direction !== this.direction) {
                 // opposite press = immediate stop, dead-time, full travel the other way
-                this.nextDir = dir;
-                this.stopTrip("reverse to " + DIR_NAME[dir] + " (" + source + ")");
+                this.reverseTo = direction;
+                this.stopRun("reverse to " + DIRECTION_NAME[direction] + " (" + source + ")");
                 return "reversing";
             }
-            if (source !== "input")
+            if (source !== "input" /* RequestSource.Input */)
                 return "already-running";
             this.log("same-direction press during run ignored");
             return "ignored";
         }
-        if (this.state !== "IDLE")
+        if (this.state !== "IDLE" /* MachineState.Idle */)
             return "busy"; // COOLDOWN (chain counted above)
-        if (this.rogueOn()) {
+        if (this.rogueOutputOn()) {
             this.fault("output ON while believed IDLE");
             return "fault";
         }
-        if (this.outOn(UP) || this.outOn(DOWN)) {
+        if (this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */)) {
             this.log("outputs settling — press again");
             return "settling";
         }
-        if (this.inOn(dir === UP ? DOWN : UP)) {
-            this.log("opposite input held — refusing " + DIR_NAME[dir]);
+        if (this.inputOn(this.opposite(direction))) {
+            this.log("opposite input held — refusing " + DIRECTION_NAME[direction]);
             this.cooldown();
             return "conflict";
         }
-        this.dir = dir;
+        this.direction = direction;
         return this.startRun(false) ? "accepted" : "aborted";
     };
-    // same-direction double-press: enter/exit jog mode (entering stops any run)
-    LiftArbiter.prototype.toggleJog = function (dir) {
-        this.jog = !this.jog;
-        this.log("jog mode " + (this.jog ? "ON (hold-to-run)" : "OFF"));
-        if (this.jog && this.state === "RUNNING") {
-            this.stopTrip("jog entry");
+    // double-press: enter/exit jog mode (entering stops any run)
+    LiftArbiter.prototype.toggleJogMode = function () {
+        this.jogMode = !this.jogMode;
+        this.log("jog mode " + (this.jogMode ? "ON (hold-to-run)" : "OFF"));
+        if (this.state === "RUNNING" /* MachineState.Running */) {
+            this.stopRun(this.jogMode ? "jog entry" : "jog exit");
         }
-        else if (!this.jog && this.state === "RUNNING") {
-            this.stopTrip("jog exit"); // exiting mid-hold: stop; next press = travel
-        }
-        return this.jog ? "jog-on" : "jog-off";
+        return this.jogMode ? "jog-on" : "jog-off";
     };
     // jog mode press: run unlatched while held (release stops it)
-    LiftArbiter.prototype.jogPress = function (dir) {
-        if (this.state === "RUNNING") {
-            if (dir !== this.dir) {
-                this.nextDir = null; // no auto-reverse in jog: just stop
-                this.stopTrip("jog: opposite press");
+    LiftArbiter.prototype.jogPress = function (direction) {
+        if (this.state === "RUNNING" /* MachineState.Running */) {
+            if (direction !== this.direction) {
+                this.reverseTo = null; // no auto-reverse in jog: just stop
+                this.stopRun("jog: opposite press");
                 return "stopped";
             }
             return "ignored";
         }
-        if (this.state !== "IDLE")
+        if (this.state !== "IDLE" /* MachineState.Idle */)
             return "busy";
-        if (this.rogueOn()) {
+        if (this.rogueOutputOn()) {
             this.fault("output ON while believed IDLE");
             return "fault";
         }
-        if (this.outOn(UP) || this.outOn(DOWN))
+        if (this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */))
             return "settling";
-        if (this.inOn(dir === UP ? DOWN : UP))
+        if (this.inputOn(this.opposite(direction)))
             return "conflict";
-        this.dir = dir;
+        this.direction = direction;
         return this.startRun(true) ? "accepted" : "aborted";
     };
-    // unlatched=true: jog hold-to-run (release stops); firmware Auto-Off still backs it up
-    LiftArbiter.prototype.startRun = function (unlatched) {
-        if (this.outOn(UP) || this.outOn(DOWN)) {
-            if (this.rogueOn()) {
-                this.fault("output ON at trip start");
+    // holdToRun=true: jog (release stops); firmware Auto-Off still backs it up
+    LiftArbiter.prototype.startRun = function (holdToRun) {
+        if (this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */)) {
+            if (this.rogueOutputOn()) {
+                this.fault("output ON at run start");
             }
             else {
+                // our own OFF command hasn't landed yet (queue lag): abort quietly
                 this.log("outputs still settling — run aborted, press again");
                 this.cooldown();
             }
@@ -524,149 +580,211 @@ var LiftArbiter = /** @class */ (function () {
         }
         // RUNNING before energizing: a press landing between decision and relay
         // closure is handled by the run rules, never as a second acceptance.
-        this.state = "RUNNING";
-        this.runOnTs = Date.now();
-        this.lastRunDir = this.dir;
-        this.onPending = this.dir;
-        this.setPos("mid"); // persisted before energizing
-        this.setOut(this.dir, true);
+        this.state = "RUNNING" /* MachineState.Running */;
+        this.runStartedAt = Date.now();
+        this.lastRunDirection = this.direction;
+        this.expectedOnEcho = this.direction;
+        this.setPosition("mid" /* Position.Mid */); // persisted before energizing
+        this.setOutput(this.direction, true);
         this.log("RUNNING " +
-            DIR_NAME[this.dir] +
-            (this.calib ? " (calibration)" : unlatched ? " (jog hold)" : ""));
+            DIRECTION_NAME[this.direction] +
+            (this.calibrating ? " (calibration)" : holdToRun ? " (jog hold)" : ""));
         return true;
     };
-    LiftArbiter.prototype.release = function (dir) {
-        if (this.resetTimer !== null) {
-            Timer.clear(this.resetTimer);
-            this.resetTimer = null;
+    LiftArbiter.prototype.release = function (direction) {
+        if (this.bothHeldTimer !== null) {
+            Timer.clear(this.bothHeldTimer);
+            this.bothHeldTimer = null;
         }
-        if (this.holdTimer !== null) {
-            Timer.clear(this.holdTimer);
-            this.holdTimer = null;
+        if (this.holdEscapeTimer !== null) {
+            Timer.clear(this.holdEscapeTimer);
+            this.holdEscapeTimer = null;
         }
         // jog hold-to-run: release of the running direction stops the run
-        if (this.jog && !this.calib && this.state === "RUNNING" && dir === this.dir) {
-            this.stopTrip("jog release");
+        if (this.jogMode &&
+            !this.calibrating &&
+            this.state === "RUNNING" /* MachineState.Running */ &&
+            direction === this.direction) {
+            this.stopRun("jog release");
         }
     };
     // ---- hardware feedback ----
+    // S3: platform physically reached a terminal; direction of travel disambiguates
     LiftArbiter.prototype.limitHit = function () {
-        var d = this.state === "RUNNING" ? this.dir : this.lastRunDir;
-        if (d === null) {
+        var direction = this.state === "RUNNING" /* MachineState.Running */ ? this.direction : this.lastRunDirection;
+        if (direction === null) {
             this.log("limit feedback with no known direction — ignored");
             return;
         }
-        this.atTerminal(d, "S3 feedback");
-        if (this.calib) {
-            this.calib = false;
+        this.atTerminal(direction, "S3 feedback");
+        if (this.calibrating) {
+            this.calibrating = false;
             this.log("CALIBRATION complete — at top, 100%");
         }
-        if (this.state === "RUNNING") {
-            this.stopping = this.outOn(UP) || this.outOn(DOWN);
-            this.bothOff();
+        if (this.state === "RUNNING" /* MachineState.Running */) {
+            this.expectingOffEcho = this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */);
+            this.bothOff(); // end the command; motion already ended at the Harmar limit
             this.cooldown();
         }
     };
-    LiftArbiter.prototype.onSwitchStatus = function (st) {
-        if (st.name !== "switch" || (st.id !== UP && st.id !== DOWN))
+    LiftArbiter.prototype.onSwitchStatus = function (status) {
+        if (status.name !== "switch")
             return;
-        if (!st.delta || st.delta.output === undefined)
+        if (status.id !== 0 /* Direction.Up */ && status.id !== 1 /* Direction.Down */)
             return;
-        var id = st.id;
-        if (this.outOn(UP) && this.outOn(DOWN)) {
+        if (!status.delta || status.delta.output === undefined)
+            return;
+        var id = status.id;
+        var source = status.delta.source ? status.delta.source : "?";
+        if (this.outputOn(0 /* Direction.Up */) && this.outputOn(1 /* Direction.Down */)) {
             this.fault("both outputs ON");
             return;
         }
-        if (st.delta.output === false) {
-            if (this.runOnTs !== 0 && id === this.lastRunDir) {
-                this.updateEst(id, Date.now() - this.runOnTs);
-                this.runOnTs = 0;
-            }
-            if (this.stopping) {
-                this.stopping = false;
-                this.declareFromEst();
-                return;
-            }
-            if (this.state === "RUNNING" && id === this.dir) {
-                this.log("Auto-Off end of run");
-                this.atTerminal(id, "Auto-Off");
-                if (this.calib) {
-                    this.calib = false;
-                    this.log("CALIBRATION complete — at top, 100%");
-                }
-                this.cooldown();
+        if (status.delta.output === false) {
+            this.onOutputOff(id, source);
+        }
+        else {
+            this.onOutputOn(id, source);
+        }
+    };
+    LiftArbiter.prototype.onOutputOff = function (id, source) {
+        // integrate actual energized time regardless of why the run ended
+        if (this.runStartedAt !== 0 && id === this.lastRunDirection) {
+            this.integrateRunTime(id, Date.now() - this.runStartedAt);
+            this.runStartedAt = 0;
+        }
+        if (this.expectingOffEcho) {
+            this.expectingOffEcho = false;
+            this.declareFloorFromEstimate();
+            return;
+        }
+        if (this.state !== "RUNNING" /* MachineState.Running */ || id !== this.direction)
+            return;
+        if (source === "timer") {
+            // firmware Auto-Off: the run drove onto its limit
+            this.log("Auto-Off end of run");
+            this.atTerminal(id, "Auto-Off");
+            if (this.calibrating) {
+                this.calibrating = false;
+                this.log("CALIBRATION complete — at top, 100%");
             }
         }
         else {
-            if (id === this.onPending) {
-                this.onPending = null; // our own commanded-ON echo
-                return;
+            // deliberate external OFF (UI/RPC): a stop, NOT a floor declaration
+            this.log("external stop (source=" + source + ")");
+            if (this.calibrating) {
+                this.calibrating = false;
+                this.calibrationPending = false;
+                this.log("calibration aborted by external stop");
             }
-            if (!this.outOn(id))
-                return; // stale
-            if (this.state !== "RUNNING" || id !== this.dir) {
-                this.fault("unexpected output ON: switch:" +
-                    id +
-                    " source=" +
-                    (st.delta.source ? st.delta.source : "?"));
-            }
+            this.declareFloorFromEstimate();
         }
+        this.cooldown();
+    };
+    LiftArbiter.prototype.onOutputOn = function (id, source) {
+        if (id === this.expectedOnEcho) {
+            this.expectedOnEcho = null; // our own commanded-ON echo
+            return;
+        }
+        if (!this.outputOn(id))
+            return; // stale event: already off again
+        if (this.state === "RUNNING" /* MachineState.Running */ && id === this.direction)
+            return; // duplicate echo
+        // deliberate external ON (management UI / direct RPC): adopt it as a
+        // governed run instead of faulting — Auto-Off is already armed by fw,
+        // and every arbiter rule (stop/reverse/gestures) applies from here on
+        var deliberate = source !== "?" && source !== "init" && source !== "timer" && source !== "loopback";
+        if (deliberate &&
+            !this.calibrating &&
+            !this.calibrationPending &&
+            (this.state === "IDLE" /* MachineState.Idle */ || this.state === "COOLDOWN" /* MachineState.Cooldown */) &&
+            !this.outputOn(this.opposite(id))) {
+            this.adoptRun(id, source);
+            return;
+        }
+        this.fault("unexpected output ON: switch:" + id + " source=" + source);
+    };
+    // an external command turned an output on: take ownership of the run
+    LiftArbiter.prototype.adoptRun = function (id, source) {
+        this.log("ADOPTED external " + DIRECTION_NAME[id] + " run (source=" + source + ")");
+        this.cooldownUntil = 0;
+        this.state = "RUNNING" /* MachineState.Running */;
+        this.direction = id;
+        this.commandedOn[id] = true; // sync intent with reality
+        this.reverseTo = null; // any pending reversal is superseded
+        this.runStartedAt = Date.now();
+        this.lastRunDirection = id;
+        this.expectedOnEcho = null;
+        this.setPosition("mid" /* Position.Mid */);
     };
     // ---- init ----
     LiftArbiter.prototype.init = function () {
+        var _this = this;
         this.io.attach(this);
         this.bothOff(); // fail-safe regardless of pre-boot state
-        var self = this;
-        // est restore chained after pos restore: its fallback derives from pos
-        this.io.pushJob("KVS.Get", { key: CFG.POS_KEY }, function (r, ec) {
-            var rv = r;
-            if (ec === 0 && rv && typeof rv.value === "string")
-                self.pos = rv.value;
-            self.log("position restored: " + self.pos);
-            self.io.whQueue = [
-                CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (self.pos === "top"),
-                CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (self.pos === "bottom"),
-            ];
-            self.io.pushJob("KVS.Get", { key: CFG.EST_KEY }, function (r2, ec2) {
-                var rv2 = r2;
-                if (ec2 === 0 && rv2 && rv2.value !== "" && typeof rv2.value === "string") {
-                    var e = JSON.parse(rv2.value);
-                    if (typeof e === "number")
-                        self.est = e;
+        // restore chain: webhook base -> position -> estimate (each depends on prior)
+        this.io.pushOneShot("KVS.Get", { key: CFG.WEBHOOK_KEY }, function (result, errorCode) {
+            var record = result;
+            if (errorCode === 0 && record && typeof record.value === "string" && record.value !== "") {
+                CFG.WEBHOOK_BASE = record.value;
+                _this.log("webhook base from KVS: " + CFG.WEBHOOK_BASE);
+            }
+            _this.io.pushOneShot("KVS.Get", { key: CFG.POSITION_KEY }, function (posResult, posError) {
+                var posRecord = posResult;
+                if (posError === 0 && posRecord && typeof posRecord.value === "string") {
+                    _this.position = posRecord.value;
                 }
-                if (self.est === null) {
-                    if (self.pos === "top")
-                        self.est = 1;
-                    else if (self.pos === "bottom")
-                        self.est = 0;
-                }
-                self.log("est restored: " + (self.est === null ? "null" : self.est));
+                _this.log("position restored: " + _this.position);
+                _this.pushPositionSensors();
+                _this.pushFaultAlert(false); // healthy boot clears any stale alarm
+                _this.io.pushOneShot("KVS.Get", { key: CFG.ESTIMATE_KEY }, function (estResult, estError) {
+                    var estRecord = estResult;
+                    if (estError === 0 &&
+                        estRecord &&
+                        estRecord.value !== "" &&
+                        typeof estRecord.value === "string") {
+                        var parsed = JSON.parse(estRecord.value);
+                        if (typeof parsed === "number")
+                            _this.estimate = parsed;
+                    }
+                    if (_this.estimate === null) {
+                        if (_this.position === "top" /* Position.Top */)
+                            _this.estimate = 1;
+                        else if (_this.position === "bottom" /* Position.Bottom */)
+                            _this.estimate = 0;
+                    }
+                    _this.log("est restored: " + (_this.estimate === null ? "null" : _this.estimate));
+                });
             });
         });
-        var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
-        this.limitFb = lc !== null && lc.enable === true;
-        this.log("S3 limit feedback: " + (this.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"));
-        for (var i = UP; i <= DOWN; i++) {
-            var c = Shelly.getComponentConfig("switch:" + i);
-            if (c) {
-                if (c.auto_off && typeof c.auto_off_delay === "number") {
-                    if (i === UP)
-                        CFG.TRAVEL_UP_MS = c.auto_off_delay * 1000;
-                    else
-                        CFG.TRAVEL_DOWN_MS = c.auto_off_delay * 1000;
-                }
-                if (c.initial_state !== "off")
-                    this.log("WARN switch:" + i + " initial_state='" + c.initial_state + "'");
-                if (c.in_mode !== "detached")
-                    this.log("WARN switch:" + i + " in_mode='" + c.in_mode + "'");
-                if (!c.auto_off)
-                    this.log("WARN switch:" + i + " auto_off DISABLED");
+        var limitConfig = Shelly.getComponentConfig("input:" + CFG.LIMIT_INPUT);
+        this.limitFeedbackActive = limitConfig !== null && limitConfig.enable === true;
+        this.log("S3 limit feedback: " +
+            (this.limitFeedbackActive ? "ACTIVE" : "not wired (input:2 disabled)"));
+        for (var id = 0 /* Direction.Up */; id <= 1 /* Direction.Down */; id++) {
+            var switchConfig = Shelly.getComponentConfig("switch:" + id);
+            if (!switchConfig)
+                continue;
+            if (switchConfig.auto_off && typeof switchConfig.auto_off_delay === "number") {
+                // Auto-Off >= travel time, so it doubles as the full-travel scale
+                if (id === 0 /* Direction.Up */)
+                    CFG.TRAVEL_UP_MS = switchConfig.auto_off_delay * 1000;
+                else
+                    CFG.TRAVEL_DOWN_MS = switchConfig.auto_off_delay * 1000;
             }
+            if (switchConfig.initial_state !== "off") {
+                this.log("WARN switch:" + id + " initial_state='" + switchConfig.initial_state + "'");
+            }
+            if (switchConfig.in_mode !== "detached") {
+                this.log("WARN switch:" + id + " in_mode='" + switchConfig.in_mode + "'");
+            }
+            if (!switchConfig.auto_off)
+                this.log("WARN switch:" + id + " auto_off DISABLED");
         }
-        this.log("armed — rev11 direction-agnostic gestures, cooldown " +
+        this.log("armed — rev12 adoption+enums, cooldown " +
             CFG.COOLDOWN_MS +
             "ms (tick-confirmed), chain " +
-            CFG.DBL_MS +
+            CFG.CHAIN_MS +
             "ms, travel " +
             CFG.TRAVEL_UP_MS / 1000 +
             "s/" +
@@ -679,72 +797,75 @@ var LiftArbiter = /** @class */ (function () {
 // wiring
 // ---------------------------------------------------------------------------
 var arbiter = new LiftArbiter();
-Shelly.addEventHandler(arbiter.guard("eventHandler", function (ev) {
-    if (!ev.info || ev.info.event !== "toggle")
+Shelly.addEventHandler(arbiter.guard("eventHandler", function (event) {
+    if (!event.info || event.info.event !== "toggle")
         return;
-    if (ev.component === "input:" + CFG.LIMIT_IN) {
-        if (arbiter.limitFb && ev.info.state === true)
+    if (event.component === "input:" + CFG.LIMIT_INPUT) {
+        if (arbiter.limitFeedbackActive && event.info.state === true)
             arbiter.limitHit();
         return;
     }
-    if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN)
+    if (event.component !== "input:" + 0 /* Direction.Up */ &&
+        event.component !== "input:" + 1 /* Direction.Down */) {
         return;
-    var id = ev.info.id;
-    if (ev.info.state === true)
-        arbiter.request(id, "input");
+    }
+    var id = event.info.id;
+    if (event.info.state === true)
+        arbiter.request(id, "input" /* RequestSource.Input */);
     else
         arbiter.release(id);
 }));
-Shelly.addStatusHandler(arbiter.guard("statusHandler", function (st) {
-    arbiter.onSwitchStatus(st);
+Shelly.addStatusHandler(arbiter.guard("statusHandler", function (status) {
+    arbiter.onSwitchStatus(status);
 }));
 // http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|calibrate|reset|jog|hist | ?set=top|bottom|mid
-HTTPServer.registerEndpoint("lift", function (req, res) {
-    var q = req.query ? req.query : "";
+HTTPServer.registerEndpoint("lift", function (request, response) {
+    var query = request.query ? request.query : "";
     var result = "status";
     try {
-        if (q.indexOf("cmd=stop") !== -1) {
-            arbiter.calib = false;
-            arbiter.calibPending = false;
-            arbiter.nextDir = null;
-            if (arbiter.state === "RUNNING") {
-                arbiter.stopTrip("http stop");
+        if (query.indexOf("cmd=stop") !== -1) {
+            arbiter.calibrating = false;
+            arbiter.calibrationPending = false; // http stop is a calibration escape hatch
+            arbiter.reverseTo = null;
+            if (arbiter.state === "RUNNING" /* MachineState.Running */) {
+                arbiter.stopRun("http stop");
                 result = "stopped";
             }
             else {
                 result = "not-running";
             }
         }
-        else if (q.indexOf("cmd=calibrate") !== -1) {
-            result = arbiter.calib ? "already-calibrating" : arbiter.startCalibration("http");
+        else if (query.indexOf("cmd=calibrate") !== -1) {
+            result = arbiter.calibrating ? "already-calibrating" : arbiter.startCalibration("http");
         }
-        else if (q.indexOf("cmd=reset") !== -1) {
+        else if (query.indexOf("cmd=reset") !== -1) {
             arbiter.hardReset("http");
             result = "reset";
         }
-        else if (q.indexOf("cmd=jog") !== -1) {
-            result = arbiter.toggleJog(UP);
+        else if (query.indexOf("cmd=jog") !== -1) {
+            result = arbiter.toggleJogMode();
         }
-        else if (q.indexOf("cmd=hist") !== -1) {
+        else if (query.indexOf("cmd=hist") !== -1) {
             result = "hist";
         }
-        else if (q.indexOf("dir=up") !== -1) {
-            result = arbiter.request(UP, "http");
+        else if (query.indexOf("dir=up") !== -1) {
+            result = arbiter.request(0 /* Direction.Up */, "http" /* RequestSource.Http */);
         }
-        else if (q.indexOf("dir=down") !== -1) {
-            result = arbiter.request(DOWN, "http");
+        else if (query.indexOf("dir=down") !== -1) {
+            result = arbiter.request(1 /* Direction.Down */, "http" /* RequestSource.Http */);
         }
-        else if (q.indexOf("set=") !== -1) {
-            var p = null;
-            if (q.indexOf("set=top") !== -1)
-                p = "top";
-            else if (q.indexOf("set=bottom") !== -1)
-                p = "bottom";
-            else if (q.indexOf("set=mid") !== -1)
-                p = "mid";
-            if (p !== null && arbiter.state === "IDLE") {
-                arbiter.setEst(p === "top" ? 1 : p === "bottom" ? 0 : null);
-                arbiter.setPos(p);
+        else if (query.indexOf("set=") !== -1) {
+            // manual position calibration, only while stationary
+            var requested = null;
+            if (query.indexOf("set=top") !== -1)
+                requested = "top" /* Position.Top */;
+            else if (query.indexOf("set=bottom") !== -1)
+                requested = "bottom" /* Position.Bottom */;
+            else if (query.indexOf("set=mid") !== -1)
+                requested = "mid" /* Position.Mid */;
+            if (requested !== null && arbiter.state === "IDLE" /* MachineState.Idle */) {
+                arbiter.setEstimate(requested === "top" /* Position.Top */ ? 1 : requested === "bottom" /* Position.Bottom */ ? 0 : null);
+                arbiter.setPosition(requested);
                 result = "calibrated";
             }
             else {
@@ -752,24 +873,24 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
             }
         }
     }
-    catch (e) {
-        arbiter.fault("exception in http handler: " + e.message);
+    catch (error) {
+        arbiter.fault("exception in http handler: " + error.message);
         result = "error";
     }
     var body = {
         result: result,
         state: arbiter.state,
-        dir: arbiter.dir === null ? null : DIR_NAME[arbiter.dir],
-        jog: arbiter.jog,
-        calib: arbiter.calib || arbiter.calibPending,
-        pos: arbiter.pos,
-        pct: arbiter.est === null ? null : Math.round(arbiter.est * 100),
-        est: arbiter.est === null ? null : Math.round(arbiter.est * 100) / 100,
+        dir: arbiter.direction === null ? null : DIRECTION_NAME[arbiter.direction],
+        jog: arbiter.jogMode,
+        calib: arbiter.calibrating || arbiter.calibrationPending,
+        pos: arbiter.position,
+        pct: arbiter.estimate === null ? null : Math.round(arbiter.estimate * 100),
+        est: arbiter.estimate === null ? null : Math.round(arbiter.estimate * 100) / 100,
     };
     if (result === "hist")
-        body.hist = arbiter.hist;
-    res.code = 200;
-    res.body = JSON.stringify(body);
-    res.send();
+        body.hist = arbiter.history;
+    response.code = 200;
+    response.body = JSON.stringify(body);
+    response.send();
 });
 arbiter.init();

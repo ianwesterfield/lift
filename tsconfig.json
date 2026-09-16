@@ -1,7 +1,9 @@
 {
   "compilerOptions": {
     "target": "ES5",
-    "lib": ["ES5"],
+    "lib": [
+      "ES5"
+    ],
     "types": [],
     "strict": true,
     "noImplicitReturns": true,
@@ -11,5 +13,7 @@
     "outDir": "scripts",
     "newLine": "lf"
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts"
+  ]
 }

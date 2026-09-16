@@ -35,25 +35,27 @@ function createEnv() {
   const schedule = (delay, fn) =>
     env.queue.push({ t: env.now + delay, seq: env.seq++, fn });
 
-  const emitSwitchStatus = (id, output) =>
+  const emitSwitchStatus = (id, output, source) =>
     schedule(1, () => {
       for (const h of env.statusHandlers)
         h({
           name: "switch",
           id,
           component: "switch:" + id,
-          delta: { output, source: "test" },
+          delta: { output, source },
         });
     });
 
-  function setOutput(id, on) {
+  function setOutput(id, on, source) {
     if (env.outputs[id] === on) return;
     env.outputs[id] = on;
     if (env.outputs[0] && env.outputs[1]) env.bothOnViolations++;
     env.autoOffAt[id] = on ? env.now + env.autoOff[id] * 1000 : null;
-    emitSwitchStatus(id, on);
+    emitSwitchStatus(id, on, source);
   }
-  env.setOutputExternal = setOutput; // simulate rogue direct RPC control
+  // simulate a deliberate external command (management UI / direct RPC)
+  env.setOutputExternal = (id, on, source) =>
+    setOutput(id, on, source === undefined ? "ui" : source);
 
   const Shelly = {
     call(method, params, cb, ud) {
@@ -76,7 +78,8 @@ function createEnv() {
         if (rec.clobbered) {
           ec = -103;
           em = "Missing required argument!";
-        } else if (method === "Switch.Set") setOutput(params.id, params.on);
+        } else if (method === "Switch.Set")
+          setOutput(params.id, params.on, "loopback");
         else if (method === "KVS.Set") env.kvs[params.key] = params.value;
         else if (method === "KVS.Get") {
           if (params.key in env.kvs) result = { value: env.kvs[params.key] };
@@ -100,7 +103,8 @@ function createEnv() {
           auto_off: true,
           auto_off_delay: env.autoOff[+id],
         };
-      if (name === "input") return { enable: +id !== 2 };
+      if (name === "input")
+        return { enable: +id === 2 ? env.limitEnabled === true : true };
       return null;
     },
     addEventHandler(fn) {
@@ -181,7 +185,7 @@ function createEnv() {
           const id = next.ref;
           env.autoOffAt[id] = null;
           env.outputs[id] = false;
-          emitSwitchStatus(id, false);
+          emitSwitchStatus(id, false, "timer"); // firmware Auto-Off source
         }
       } catch (e) {
         env.crashed = e; // mirrors real firmware: script halts on uncaught
