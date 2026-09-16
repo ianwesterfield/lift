@@ -1,0 +1,13 @@
+{
+  "name": "lift-arbiter",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Harmar Highlander II motion arbiter for Shelly Pro 3 (TypeScript -> mJS-safe ES5)",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node test/run-tests.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

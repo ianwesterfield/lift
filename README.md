@@ -38,14 +38,14 @@ Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip,
 
 States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. All runs are latched — releases carry no meaning. **Chained presses must land within 0.5 s of the previous press.**
 
-| Gesture                                              | Result                                                                        |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
-| **Single press** (idle)                              | Latched full run that direction (starts after 75 ms arbitration)               |
-| Lone press during a run                              | Ignored — interrupting must be deliberate                                      |
-| **Double-press** (2nd press ≤ 0.5 s, any direction)  | **Interrupt: stop the run** (never reverse); single press after = new full run |
-| **Triple-press** (3 chained presses)                 | **Calibration**: full-UP ride, paddle IGNORED until Auto-Off → top / 100%      |
-| Opposite press within the 75 ms arbitration window   | Cancelled, neither output fires, cooldown                                      |
-| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                 |
+| Gesture                                              | Result                                                                                                                                     |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Single press** (idle)                              | Latched full run that direction (starts after 75 ms arbitration)                                                                           |
+| Lone press during a run                              | Ignored — interrupting must be deliberate                                                                                                  |
+| **Double-press** (2nd press ≤ 0.5 s, any direction)  | **Interrupt: stop the run** (never reverse); single press after = new full run                                                             |
+| **Triple-press** (3 chained presses)                 | **Calibration**: full-UP ride, paddle IGNORED until Auto-Off → top / 100%                                                                  |
+| Opposite press within the 75 ms arbitration window   | Cancelled, neither output fires, cooldown                                                                                                  |
+| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                                                                             |
 | **Hold either paddle 3 s during FAULT/calibration**  | **Hard reset / lockout escape** (keeps position). Never triggers in normal use — runs are latched, so leaning on the paddle is meaningless |
 
 The physical control is a rocker — one person cannot press UP+DOWN together (that gesture still exists in code and would require two stations pressed simultaneously). The single-paddle hold is the practical lockout escape.
@@ -142,6 +142,8 @@ Use short Auto-Off values (e.g., 5 s) for steps 1–7, restore 55/45 for 8–9.
 
 ## Files
 
-- [scripts/lift-arbiter.js](scripts/lift-arbiter.js) — the Shelly script (single `request()` entry point for all sources).
-- [test/shelly-mock.js](test/shelly-mock.js) — Shelly script-environment emulator: virtual clock/timers, async RPC + status-event echoes, relay Auto-Off, enforces the firmware ~5-concurrent-call limit.
-- [test/run-tests.js](test/run-tests.js) — unit + fuzz suite (`node test/run-tests.js`): every gesture, race cases (stop vs Auto-Off, stop vs ON-echo), FAULT/recovery, RPC-burst limit, 250 seeded random button-mash sequences with a recoverability check, and the literal Konami code. Run before every deploy.
+- [src/lift-arbiter.ts](src/lift-arbiter.ts) — **source of truth** (TypeScript, strict). Build: `npm run build` → emits mJS-safe ES5 (no modules, no helpers) into scripts/.
+- [src/shelly.d.ts](src/shelly.d.ts) — ambient declarations for the Shelly Gen2 script environment.
+- [scripts/lift-arbiter.js](scripts/lift-arbiter.js) — **generated** deploy artifact; do not edit by hand. Tests and deploy consume this exact file.
+- [test/shelly-mock.js](test/shelly-mock.js) — Shelly script-environment emulator: virtual clock/timers, async RPC + status-event echoes, relay Auto-Off, the firmware ~5-concurrent-call limit, AND the same-tick params-clobber quirk.
+- [test/run-tests.js](test/run-tests.js) — unit + fuzz suite (`npm test` = build + run): every gesture, reversal, calibration, races, FAULT/recovery, RPC-burst limit, 250 seeded random button-mash sequences with a recoverability check, and the literal Konami code. Run before every deploy.
