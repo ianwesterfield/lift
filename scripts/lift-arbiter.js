@@ -255,17 +255,21 @@ function request(dir, source) {
     return "duplicate";
   }
 
-  // jog mode: double-tap (tap, then same-direction press within DBL_MS) = jog OFF
-  if (
+  // jog mode: double-tap = exit jog AND begin full travel that direction
+  var jogExit =
     S.jog &&
     source === "input" &&
     S.lastTapDir === dir &&
-    Date.now() - S.lastTapTs <= CFG.DBL_MS
-  ) {
+    Date.now() - S.lastTapTs <= CFG.DBL_MS;
+  if (jogExit) {
     S.lastTapDir = null;
     S.jog = false;
-    log("double-tap — jog mode OFF");
-    return "jog-off";
+    log("double-tap — jog OFF, full travel " + DIR_NAME[dir]);
+    if (S.state === "COOLDOWN") {
+      // the 2nd press usually lands in the post-tap cooldown; safe to cut short
+      clearTimers();
+      S.state = "IDLE";
+    }
   }
 
   if (S.state !== "IDLE") return "busy"; // COOLDOWN
@@ -283,9 +287,10 @@ function request(dir, source) {
   S.state = "PENDING";
   S.dir = dir;
   S.lastTapDir = null;
-  // normal-mode physical press waits out the double-tap window; jog and HTTP
-  // use the short arbitration window only
-  var wait = !S.jog && source === "input" ? CFG.DBL_MS : CFG.ARB_MS;
+  // normal-mode physical press waits out the double-tap window; jog-exit,
+  // jog and HTTP use the short arbitration window only
+  var wait =
+    !S.jog && source === "input" && !jogExit ? CFG.DBL_MS : CFG.ARB_MS;
   log(DIR_NAME[dir] + " pending (" + source + ")");
   S.arbTimer = Timer.set(wait, false, function () {
     S.arbTimer = null;

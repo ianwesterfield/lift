@@ -54,7 +54,7 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 | -------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | Press and **hold**                                             | Output on while held (75 ms arbitration); release = stop, stay in jog mode |
 | Single **tap** (< 400 ms)                                      | Nudge at most (nothing if released within 75 ms); arms jog-exit double-tap |
-| **Double-tap** (2nd press within 1 s of a tap, same direction) | **Jog mode OFF** — no motion                                               |
+| **Double-tap** (2nd press within 1 s of a tap, same direction) | **Jog mode OFF + latched full trip in that direction** (starts immediately) |
 | Any run that reaches a limit (Auto-Off / dead reckoning / S3)  | Floor declared → **exit jog mode** automatically                           |
 
 HTTP/HomeKit requests are always latched full trips in either mode (75 ms window only); `?cmd=jog` toggles jog mode remotely.
