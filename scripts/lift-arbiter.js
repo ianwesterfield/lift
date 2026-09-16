@@ -10,8 +10,7 @@
 var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  TAP_MS: 400, // jog mode: press shorter than this = tap (arms jog-exit double-tap)
-  DBL_MS: 1000, // gesture window: all presses of a command within 1 s
+  DBL_MS: 1000, // gesture window: each press within 1 s of the previous
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
   EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
@@ -29,13 +28,15 @@ var DIR_NAME = ["UP", "DOWN"];
 var S = {
   state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  jog: false, // set by interrupting a trip; cleared when a run ends at a limit
+  jog: false, // toggled ONLY by triple-press / ?cmd=jog / reset
   latched: false, // RUNNING: true = full trip, false = hold-to-run (jog)
-  lastTapDir: null, // jog-exit double-tap arming
-  lastTapTs: 0,
+  seqN: 0, // same-direction press counter for gestures
+  seqDir: null,
+  seqTs: 0,
   pressTs: 0,
   runOnTs: 0, // when the output actually energized (dead reckoning)
   lastRunDir: null,
+  onPending: null, // switch id whose commanded-ON status echo is still in flight
   est: null, // 0=bottom..1=top travel estimate; null until first known floor
   stopping: false, // we commanded OFF; swallow the resulting status event
   arbTimer: null,
@@ -146,7 +147,6 @@ function updateEst(dirId, dtMs) {
 
 // a run reached a terminal for certain (Auto-Off, S3 feedback)
 function atTerminal(dirId, why) {
-  S.jog = false;
   setEst(dirId === UP ? 1 : 0);
   setPos(dirId === UP ? "top" : "bottom");
   log("at " + (dirId === UP ? "top" : "bottom") + " (" + why + ")");
@@ -193,7 +193,8 @@ function cooldown() {
 
 function stopTrip(reason) {
   log("STOP (" + reason + ")");
-  S.stopping = true;
+  // only expect an off-event if something is actually on (a stop can race Auto-Off)
+  S.stopping = outOn(UP) || outOn(DOWN);
   bothOff();
   cooldown();
 }
@@ -207,8 +208,10 @@ function hardReset(source) {
   S.dir = null;
   S.jog = false;
   S.latched = false;
-  S.lastTapDir = null;
+  S.seqN = 0;
+  S.seqDir = null;
   S.stopping = false;
+  S.onPending = null;
   S.runOnTs = 0;
 }
 
@@ -230,6 +233,30 @@ function request(dir, source) {
     return "fault";
   }
 
+  // same-direction press sequence: 3rd press within the chain toggles jog mode
+  if (source === "input") {
+    if (S.seqDir === dir && Date.now() - S.seqTs <= CFG.DBL_MS) S.seqN++;
+    else {
+      S.seqN = 1;
+      S.seqDir = dir;
+    }
+    S.seqTs = Date.now();
+    if (S.seqN >= 3) {
+      S.seqN = 0;
+      S.seqDir = null;
+      if (S.state === "PENDING") {
+        clearTimers();
+        S.state = "IDLE";
+        S.dir = null;
+      } else if (S.state === "RUNNING") {
+        stopTrip("gesture press");
+      }
+      S.jog = !S.jog;
+      log("triple-press — jog mode " + (S.jog ? "ON" : "OFF"));
+      return S.jog ? "jog-on" : "jog-off";
+    }
+  }
+
   if (S.state === "RUNNING") {
     // any press during a trip = stop (mode unchanged)
     stopTrip(DIR_NAME[dir] + " press during trip, " + source);
@@ -244,35 +271,17 @@ function request(dir, source) {
       return "conflict";
     }
     if (!S.jog && source === "input") {
-      // 2nd same-direction press before the trip started = double-tap: jog ON
+      // 2nd press cancels the pending trip; a 3rd within 1 s toggles jog
       clearTimers();
       S.state = "IDLE";
       S.dir = null;
-      S.jog = true;
-      log("double-tap — jog mode ON");
-      return "jog-on";
+      log("2nd press — pending trip cancelled (3rd within 1 s = jog toggle)");
+      return "cancelled";
     }
     return "duplicate";
   }
 
-  // jog mode: double-tap = exit jog AND begin full travel that direction
-  var jogExit =
-    S.jog &&
-    source === "input" &&
-    S.lastTapDir === dir &&
-    Date.now() - S.lastTapTs <= CFG.DBL_MS;
-  if (jogExit) {
-    S.lastTapDir = null;
-    S.jog = false;
-    log("double-tap — jog OFF, full travel " + DIR_NAME[dir]);
-    if (S.state === "COOLDOWN") {
-      // the 2nd press usually lands in the post-tap cooldown; safe to cut short
-      clearTimers();
-      S.state = "IDLE";
-    }
-  }
-
-  if (S.state !== "IDLE") return "busy"; // COOLDOWN
+  if (S.state !== "IDLE") return "busy"; // COOLDOWN (press still counted above)
 
   if (outOn(UP) || outOn(DOWN)) {
     fault("output ON while believed IDLE");
@@ -286,11 +295,9 @@ function request(dir, source) {
 
   S.state = "PENDING";
   S.dir = dir;
-  S.lastTapDir = null;
-  // normal-mode physical press waits out the double-tap window; jog-exit,
-  // jog and HTTP use the short arbitration window only
-  var wait =
-    !S.jog && source === "input" && !jogExit ? CFG.DBL_MS : CFG.ARB_MS;
+  // normal-mode physical press waits out the gesture window; jog and HTTP
+  // use the short arbitration window only
+  var wait = !S.jog && source === "input" ? CFG.DBL_MS : CFG.ARB_MS;
   log(DIR_NAME[dir] + " pending (" + source + ")");
   S.arbTimer = Timer.set(wait, false, function () {
     S.arbTimer = null;
@@ -312,6 +319,7 @@ function startTrip(source) {
   S.pressTs = Date.now();
   S.runOnTs = Date.now();
   S.lastRunDir = S.dir;
+  S.onPending = S.dir; // expect our own ON echo (may arrive after a stop)
   setPos("mid"); // persisted before energizing: power loss mid-trip never restores a floor
   setOut(S.dir, true);
   log(
@@ -327,24 +335,14 @@ function release(dir) {
     S.resetTimer = null;
   }
   if (S.state === "PENDING" && dir === S.dir && S.jog) {
-    // jog: released inside the arbitration window — no motion, arm double-tap
+    // jog: released inside the arbitration window — no motion
     clearTimers();
     S.state = "IDLE";
     S.dir = null;
-    S.lastTapDir = dir;
-    S.lastTapTs = Date.now();
-    log("tap " + DIR_NAME[dir] + " (jog-exit double-tap armed)");
     return;
   }
   if (S.state === "RUNNING" && !S.latched && dir === S.dir) {
-    if (Date.now() - S.pressTs < CFG.TAP_MS) {
-      S.lastTapDir = dir; // short nudge counts as a tap: arms jog-exit double-tap
-      S.lastTapTs = Date.now();
-      stopTrip("tap " + DIR_NAME[dir] + " (jog-exit double-tap armed)");
-    } else {
-      S.lastTapDir = null;
-      stopTrip("jog release"); // stay in jog mode
-    }
+    stopTrip("jog release"); // stay in jog mode
   }
 }
 
@@ -369,7 +367,7 @@ function limitHit() {
   }
   atTerminal(d, "S3 feedback");
   if (S.state === "RUNNING") {
-    S.stopping = true;
+    S.stopping = outOn(UP) || outOn(DOWN);
     bothOff(); // end the command; motion already ended at the Harmar limit
     cooldown();
   }
@@ -401,6 +399,14 @@ Shelly.addStatusHandler(function (st) {
       cooldown();
     }
   } else {
+    if (st.id === S.onPending) {
+      // our own commanded-ON echo; if a stop already landed, the off-command
+      // is in flight and its off-event follows — not a fault
+      S.onPending = null;
+      return;
+    }
+    // stale ON event: we may have already commanded the output off
+    if (!outOn(st.id)) return;
     if (S.state !== "RUNNING" || st.id !== S.dir) {
       fault(
         "unexpected output ON: switch:" +
@@ -534,9 +540,7 @@ function init() {
       CFG.ARB_MS +
       "ms, cooldown " +
       CFG.COOLDOWN_MS +
-      "ms, tap " +
-      CFG.TAP_MS +
-      "ms, double-tap " +
+      "ms, gesture window " +
       CFG.DBL_MS +
       "ms, travel " +
       CFG.TRAVEL_UP_MS / 1000 +
