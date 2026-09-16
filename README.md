@@ -34,28 +34,30 @@ O3/S3 unused/reserved
 
 Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip, the active output still turns off at 55/45 s. The script must never re-issue `Switch.Set on` to extend a trip.
 
-## Behavior specification (rev 13)
+## Behavior specification (rev 14)
 
-States: `IDLE → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. Gestures are classified by **press count within 3 s of the chain's first press, direction-agnostic** — only the number of presses matters, not which paddle. (The 3 s window absorbs real-world input latency: a press travels Phoenix relay → 120 VAC → Shelly AC input detection before the script sees it.)
+States: `IDLE → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. **No press-count gestures, no modes** — what the paddle does depends only on how long it's held and what the lift is doing:
 
-| Gesture                                              | Result                                                                                                                                     |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Single press** (idle)                              | Latched full run that direction, energized immediately                                                                                     |
-| **Opposite press during a run**                      | **REVERSE**: immediate stop, dead-time, then automatic full run the other way                                                              |
-| Same-direction press during a run                    | Counts toward the chain, otherwise ignored                                                                                                 |
-| **2nd press** (any direction, ≤ 3 s chain)           | **Toggle JOG MODE** (entering stops the run, cancels any pending reverse, and fires a **0.4 s confirmation burst** in the pressed direction)  |
-| **3rd press** (any direction)                        | **Calibration**: full-UP ride, paddle IGNORED until Auto-Off → top / 100%, exits to normal mode                                            |
-| Jog mode press                                       | **Hold-to-run**: release stops; opposite press stops (no auto-reverse); double-press exits jog                                             |
-| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                                                                             |
-| **External `Switch.Set` ON** (management UI / RPC)   | **ADOPTED as a governed run** — stop/reverse/gestures all apply; conflicting or unexplained outputs still FAULT                            |
-| External `Switch.Set` OFF mid-run                    | Treated as a stop, **not** a floor declaration (aborts calibration)                                                                        |
-| **Hold either paddle 3 s during FAULT/calibration**  | **Hard reset / lockout escape** (keeps position). Never triggers in normal use — runs are latched, so leaning on the paddle is meaningless |
+| Control                                              | Result                                                                                                                                       |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Press** (tap, released < 1 s)                      | Latched full run that direction, energized immediately                                                                                       |
+| **Push** (hold ≥ 1 s)                                | Runs while held; **release stops it** (hold-to-run / jog)                                                                                     |
+| **Same-direction press during a run**                | **STOP**                                                                                                                                     |
+| **Opposite press during a run**                      | **REVERSE**: immediate stop, dead-time, then run the other way (tap = latched; keep holding = push rules apply to the reversed run)          |
+| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                                                                               |
+| **External `Switch.Set` ON** (management UI / RPC)   | **ADOPTED as a governed run** — stop/reverse rules all apply; conflicting or unexplained outputs still FAULT                                 |
+| External `Switch.Set` OFF mid-run                    | Treated as a stop, **not** a floor declaration (aborts calibration)                                                                          |
+| **Hold either paddle 3 s during FAULT/calibration**  | **Hard reset / lockout escape** (keeps position)                                                                                             |
+
+**Calibration is remote-only** (`?cmd=calibrate`): full-UP ride, paddle IGNORED until Auto-Off → top / 100%, exits to normal automatically. Escapes during the locked ride: hold either paddle 3 s, `?cmd=stop`, `?cmd=reset`.
 
 The physical control is a rocker — one person cannot press UP+DOWN together (that gesture still exists in code and would require two stations pressed simultaneously). The single-paddle hold is the practical lockout escape.
 
-Calibration exits back to normal service automatically when the ride completes at the top. A triple starting on the DOWN paddle stops the run, waits out the cooldown, then rides UP. Escapes during the locked ride: hold either paddle 3 s, `?cmd=stop`, `?cmd=reset`.
+HTTP/HomeKit `?dir=` requests are always latched full runs (they participate in stop/reverse like any other source).
 
-HTTP/HomeKit `?dir=` requests are always latched full runs (they participate in stop/reverse like any other source); `?cmd=calibrate` triggers the calibration ride; `?cmd=jog` toggles jog mode.
+### Deferred declarations (rev 13 field-crash lesson)
+
+Even memory-only work crashes mJS if the CALL CHAIN is deep: handler → `onSwitchStatus` → `onOutputOff` → `declareFloorFromEstimate` → `atTerminal` blew the stack in the field (reverse racing Auto-Off at a terminal). Floor/terminal declarations are now **deferred**: handlers set pending flags; the IO tick executes them at call depth ~3. Delay ≤ 25 ms.
 
 ### Plumbing rule (hard-won, three field crashes)
 
@@ -73,7 +75,7 @@ mJS has a tiny call stack, fw 2.0.0 clobbers params of `Shelly.call`s dispatched
 
 ### Race handling
 
-- **Event-order ambiguity at trip start:** state becomes RUNNING before `Switch.Set on`, so a press arriving between decision and relay closure is handled by the run rules (reverse/chain), never as a second acceptance.
+- **Event-order ambiguity at trip start:** state becomes RUNNING before `Switch.Set on`, so a press arriving between decision and relay closure is handled by the run rules (stop/reverse), never as a second acceptance.
 - **Stop racing our own ON echo:** the commanded-ON status event may arrive after a stop already landed; tracked via `expectedOnEcho` so it is never mistaken for a rogue output (was a real fuzzer-found bug).
 - **Stop racing Auto-Off:** `expectingOffEcho` is only armed if an output is actually on, so a swallowed off-event can't strand the flag.
 - **Auto-Off vs external stop:** the off-event's `source` disambiguates — `timer` = drove onto the limit (declare floor); anything else = an external stop (no floor declaration, calibration aborted).
@@ -84,12 +86,11 @@ mJS has a tiny call stack, fw 2.0.0 clobbers params of `Shelly.call`s dispatched
 The script registers an HTTP endpoint (Gen2 scripts cannot register RPC methods; `HTTPServer.registerEndpoint` is the supported mechanism):
 
 ```
-http://192.168.40.105/script/1/lift             → status JSON {result, state, dir, jog, calib, pos, pct, est}
+http://192.168.40.105/script/1/lift             → status JSON {result, state, dir, calib, pos, pct, est}
 http://192.168.40.105/script/1/lift?dir=up      → request UP (same arbiter path as buttons)
 http://192.168.40.105/script/1/lift?dir=down    → request DOWN
 http://192.168.40.105/script/1/lift?cmd=stop    → stop a running trip (also aborts calibration)
 http://192.168.40.105/script/1/lift?cmd=calibrate → full-UP calibration ride (paddle locked until done)
-http://192.168.40.105/script/1/lift?cmd=jog     → toggle jog (hold-to-run) mode
 http://192.168.40.105/script/1/lift?cmd=reset   → hard state reset (any state incl. FAULT; keeps position)
 http://192.168.40.105/script/1/lift?cmd=hist    → status + last 15 log lines (diagnostics)
 http://192.168.40.105/script/1/lift?set=top|bottom|mid → manual position calibration (IDLE only)
@@ -141,9 +142,9 @@ For Siri phrasing, wrap the pushbuttons in Home-app scenes ("Lift up" / "Lift do
 Automated coverage lives in [test/run-tests.js](test/run-tests.js) (25 tests incl. fuzzing) and runs on every deploy. Manual field checks — use short Auto-Off values (e.g., 5 s) for steps 1–6, restore 55/45 after:
 
 1. Single press UP, single press DOWN → latched trip each; Auto-Off ends the command and declares the floor.
-2. Opposite press mid-run → stop, then automatic full run the other way.
-3. Double-press → jog mode ON (run stops, then a short confirmation nudge in the pressed direction); hold-to-run works, release stops; double-press again → normal mode. **Wait 3 s after the double-press before jogging — a 3rd press inside the chain window is the calibration gesture.**
-4. Triple-press (mix directions) → calibration ride UP, paddle dead until the top; exits to normal.
+2. Same-direction press mid-run → stop. Opposite press mid-run → stop, then automatic full run the other way.
+3. Push (hold ≥ 1 s) → runs while held, stops on release. A push on the opposite paddle mid-run reverses, and the reversed run also stops when you let go.
+4. Calibration: `?cmd=calibrate` only → ride UP, paddle dead until the top; exits to normal. No paddle combination can trigger it.
 5. Stuck input: hold one button, press the other from IDLE → refused (`conflict` in hist).
 6. FAULT: toggle an output from the management UI while a run is active in the _opposite_ direction → both OFF, lockout; hold either paddle 3 s clears. A UI toggle while idle should be **adopted**, not fault.
 7. Reboot mid-trip → both outputs OFF at boot, state IDLE, position/est restored from KVS.
@@ -159,4 +160,4 @@ Automated coverage lives in [test/run-tests.js](test/run-tests.js) (25 tests inc
 - [scripts/lift-arbiter.js](scripts/lift-arbiter.js), [scripts/watchdog.js](scripts/watchdog.js) — **generated** deploy artifacts; do not edit by hand. Tests and deploy consume these exact files.
 - [deploy.ps1](deploy.ps1) — build + test + watchdog-safe deploy + boot-banner verification.
 - [test/shelly-mock.js](test/shelly-mock.js) — Shelly script-environment emulator: virtual clock/timers, async RPC + status-event echoes with `source` attribution, relay Auto-Off, external `Switch.Set` injection, KVS persistence across simulated restarts, the firmware ~5-concurrent-call limit, AND the same-tick params-clobber quirk.
-- [test/run-tests.js](test/run-tests.js) — unit + fuzz suite (`npm test` = build + run): every gesture, reversal, jog, calibration, adoption, S3 feedback, restart restore, races, FAULT/recovery, RPC-burst limit, 250 seeded random button-mash sequences with a recoverability check, and the literal Konami code. Run before every deploy (deploy.ps1 enforces it).
+- [test/run-tests.js](test/run-tests.js) — unit + fuzz suite (`npm test` = build + run): tap/push/stop/reverse semantics, calibration, adoption, S3 feedback, restart restore, races, FAULT/recovery, the Auto-Off-race crash regression, RPC-burst limit, 250 seeded random button-mash sequences with a recoverability check, and the literal Konami code. Run before every deploy (deploy.ps1 enforces it).

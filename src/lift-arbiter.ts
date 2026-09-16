@@ -9,18 +9,23 @@
 // O1 (switch:0) = J6 UP, O2 (switch:1) = J6 DOWN.
 // S1 (input:0)  = any physical UP request, S2 (input:1) = any physical DOWN.
 //
-// GESTURES (rev 13) — press count within 3 s of the chain's first press,
-// direction-agnostic:
-//   idle press            -> latched full travel (energized immediately)
-//   opposite press in run -> REVERSE: stop, dead-time, full travel other way
-//   2nd press             -> toggle JOG MODE (stops the run on entry; entering
-//                            fires a short confirmation burst in the pressed
-//                            direction and cancels any pending reverse)
-//   3rd press             -> CALIBRATION ride (full UP, paddle locked)
-//   jog mode              -> hold-to-run; double-press exits back to normal
-//   hold paddle 3 s       -> lockout escape (FAULT/calibration only)
-//   external Switch.Set   -> ADOPTED as a governed run (UI/RPC = just another
-//                            input); conflicts and unexplained outputs FAULT
+// CONTROLS (rev 14) — no press-count gestures, no modes:
+//   press (tap, release < 1 s)  -> latched full travel (energized immediately)
+//   push (hold >= 1 s)          -> runs while held; release stops it (jog)
+//   same-direction press in run -> STOP
+//   opposite press in run       -> REVERSE: stop, dead-time, run other way
+//                                  (tap = latched; keep holding = push rules)
+//   hold paddle 3 s             -> lockout escape (FAULT/calibration only)
+//   calibration                 -> REMOTE ONLY: ?cmd=calibrate (full UP,
+//                                  paddle locked until Auto-Off)
+//   external Switch.Set         -> ADOPTED as a governed run (UI/RPC = just
+//                                  another input); conflicts/unexplained FAULT
+//
+// CRASH LESSON (rev 13 field crash): even memory-only work dies if the CALL
+// CHAIN is deep — handler -> onSwitchStatus -> onOutputOff -> declareFloor ->
+// atTerminal blew the mJS stack. Floor/terminal declarations are therefore
+// DEFERRED: handlers set pending flags; the tick (pump) executes them at
+// depth ~3.
 //
 // ARCHITECTURE RULE (hard-won): mJS has a tiny call stack and fw 2.0.0
 // clobbers params of Shelly.call dispatched in the same tick. Handlers and
@@ -55,12 +60,6 @@ const enum RequestSource {
   Reverse = "reverse",
 }
 
-const enum GestureKind {
-  Run = "run",
-  JogToggle = "jogToggle",
-  Calibrate = "calibrate",
-}
-
 const enum JobKind {
   Relay = "relay",
   OneShot = "job",
@@ -74,14 +73,13 @@ var DIRECTION_NAME = ["UP", "DOWN"];
 
 var CFG = {
   COOLDOWN_MS: 0, // stop -> reverse/re-arm dead-time (tick-confirmed re-arm)
-  CHAIN_MS: 3000, // gesture chain: presses within 3 s of the chain's first press
+  HOLD_JOG_MS: 1000, // held >= this at release -> the run was a push: stop it
   TICK_MS: 25, // I/O drain tick
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
   ESTIMATE_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
   OFF_GRACE_MS: 2000, // commanded-OFF may lag this long before it's "rogue"
   RESET_HOLD_MS: 3000, // lockout-escape hold duration
-  JOG_BURST_MS: 400, // jog-entry confirmation nudge duration
   LIMIT_INPUT: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
   POSITION_KEY: "lift.pos",
   ESTIMATE_KEY: "lift.est",
@@ -278,42 +276,6 @@ class IoQueue {
 }
 
 // ---------------------------------------------------------------------------
-// Gestures — classifies physical presses into intents. Direction-agnostic:
-// only the NUMBER of presses within CHAIN_MS of the chain's first press counts.
-// ---------------------------------------------------------------------------
-
-class Gestures {
-  private pressCount = 0;
-  private chainStartedAt = 0;
-
-  classify(): { gesture: GestureKind; pressCount: number; } {
-    if (Date.now() - this.chainStartedAt <= CFG.CHAIN_MS) {
-      this.pressCount++;
-    } else {
-      this.pressCount = 1;
-      this.chainStartedAt = Date.now();
-    }
-
-    switch (this.pressCount) {
-      case 3:
-        this.reset();
-        return { gesture: GestureKind.Calibrate, pressCount: 3 };
-
-      case 2:
-        return { gesture: GestureKind.JogToggle, pressCount: 2 };
-
-      default:
-        return { gesture: GestureKind.Run, pressCount: this.pressCount };
-    }
-  }
-
-  reset(): void {
-    this.pressCount = 0;
-    this.chainStartedAt = 0;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // LiftArbiter — the state machine. Handlers mutate memory only; all I/O goes
 // through the IoQueue.
 // ---------------------------------------------------------------------------
@@ -321,12 +283,12 @@ class Gestures {
 class LiftArbiter {
   state: MachineState = MachineState.Idle;
   direction: Direction | null = null;
-  jogMode = false; // hold-to-run mode; toggled by double-press
   calibrating = false; // calibration ride: paddle ignored until Auto-Off
   calibrationPending = false;
   reverseTo: Direction | null = null; // reversal target after cooldown
-  burstTo: Direction | null = null; // jog-entry confirmation nudge, fired by pump
-  bursting = false; // burst is script-owned: paddle release must not stop it
+  pendingTerminal: Direction | null = null; // terminal reached; declared by pump
+  pendingTerminalWhy = "";
+  pendingFloorCheck = false; // dead-reckoning floor check; run by pump
   runStartedAt = 0;
   lastRunDirection: Direction | null = null;
   expectedOnEcho: Direction | null = null; // commanded-ON echo still in flight
@@ -342,11 +304,9 @@ class LiftArbiter {
   position: Position = Position.Unknown;
 
   io: IoQueue;
-  gestures: Gestures;
 
   constructor() {
     this.io = new IoQueue();
-    this.gestures = new Gestures();
   }
 
   // ---- logging / persistence signals ----
@@ -479,8 +439,8 @@ class LiftArbiter {
     this.calibrating = false;
     this.calibrationPending = false;
     this.reverseTo = null;
-    this.burstTo = null;
-    this.bursting = false;
+    this.pendingTerminal = null;
+    this.pendingFloorCheck = false;
     this.runStartedAt = 0; // hygiene: no stale segment survives a fault
     this.pushFaultAlert(true); // HomeKit-visible alarm
   }
@@ -491,12 +451,26 @@ class LiftArbiter {
   cooldown(): void {
     this.state = MachineState.Cooldown;
     this.direction = null;
-    this.bursting = false;
     this.cooldownUntil = Date.now() + CFG.COOLDOWN_MS;
   }
 
-  // called every IO tick: re-arm and run any pending auto-start intents
+  // called every IO tick: deferred declarations, re-arm, pending auto-starts.
+  // Floor/terminal work runs HERE (depth ~3), never in handler chains — the
+  // handler->onOutputOff->declareFloor->atTerminal chain blew the mJS stack.
   pump(): void {
+    if (this.state !== MachineState.Running) {
+      if (this.pendingTerminal !== null) {
+        var terminalDirection = this.pendingTerminal;
+        this.pendingTerminal = null;
+        this.atTerminal(terminalDirection, this.pendingTerminalWhy);
+      }
+
+      if (this.pendingFloorCheck) {
+        this.pendingFloorCheck = false;
+        this.declareFloorFromEstimate();
+      }
+    }
+
     if (this.state !== MachineState.Cooldown) return;
     if (Date.now() < this.cooldownUntil) return;
     if (this.io.relayQueue.length > 0) return; // relay commands still queued
@@ -520,39 +494,7 @@ class LiftArbiter {
 
       var outcome = this.request(target, RequestSource.Reverse);
       if (outcome !== "accepted") this.log("reverse did not start: " + outcome);
-    } else if (this.jogMode && this.burstTo !== null) {
-      this.startJogBurst();
     }
-  }
-
-  // brief nudge in the double-pressed direction: tactile "you are in jog now"
-  startJogBurst(): void {
-    var burstDirection = this.burstTo as Direction;
-    this.burstTo = null;
-
-    var outcome = this.jogPress(burstDirection);
-
-    if (outcome !== "accepted") {
-      this.log("jog burst skipped: " + outcome);
-      return;
-    }
-
-    this.bursting = true; // the second tap's release event may still be inbound
-    this.log("jog confirm burst " + DIRECTION_NAME[burstDirection]);
-
-    Timer.set(
-      CFG.JOG_BURST_MS,
-      false,
-      this.guard("jogBurstTimer", () => {
-        if (
-          this.state === MachineState.Running &&
-          this.direction === burstDirection &&
-          this.jogMode
-        ) {
-          this.stopRun("jog burst done");
-        }
-      }),
-    );
   }
 
   stopRun(reason: string): void {
@@ -569,13 +511,11 @@ class LiftArbiter {
     this.bothOff();
     this.state = MachineState.Idle;
     this.direction = null;
-    this.jogMode = false;
     this.calibrating = false;
     this.calibrationPending = false;
     this.reverseTo = null;
-    this.burstTo = null;
-    this.bursting = false;
-    this.gestures.reset();
+    this.pendingTerminal = null;
+    this.pendingFloorCheck = false;
     this.expectingOffEcho = false;
     this.expectedOnEcho = null;
     this.runStartedAt = 0;
@@ -619,13 +559,11 @@ class LiftArbiter {
     );
   }
 
-  // ---- calibration ----
+  // ---- calibration (remote only: ?cmd=calibrate) ----
 
   startCalibration(source: string): string {
     this.log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
     this.calibrating = true;
-    this.jogMode = false; // calibration always exits to normal mode
-    this.burstTo = null;
 
     if (this.state === MachineState.Running) {
       if (this.direction === Direction.Up) return "calibrating"; // this run becomes the ride
@@ -676,23 +614,7 @@ class LiftArbiter {
     }
 
     if (source === RequestSource.Input) {
-      var classified = this.gestures.classify();
-      this.log(
-        "press " +
-        DIRECTION_NAME[direction] +
-        " " +
-        classified.pressCount +
-        " (" +
-        this.state +
-        (this.jogMode ? ",jog" : "") +
-        ")",
-      );
-
-      if (classified.gesture === GestureKind.Calibrate) return this.startCalibration(source);
-
-      if (classified.gesture === GestureKind.JogToggle) return this.toggleJogMode(direction);
-
-      if (this.jogMode) return this.jogPress(direction);
+      this.log("press " + DIRECTION_NAME[direction] + " (" + this.state + ")");
     }
 
     if (this.state === MachineState.Running) {
@@ -705,11 +627,13 @@ class LiftArbiter {
 
       if (source !== RequestSource.Input) return "already-running";
 
-      this.log("same-direction press during run ignored");
-      return "ignored";
+      // same-direction press during a run = deliberate stop
+      this.reverseTo = null;
+      this.stopRun("same-direction press");
+      return "stopped";
     }
 
-    if (this.state !== MachineState.Idle) return "busy"; // COOLDOWN (chain counted above)
+    if (this.state !== MachineState.Idle) return "busy"; // COOLDOWN settling
 
     if (this.rogueOutputOn()) {
       this.fault("output ON while believed IDLE");
@@ -728,61 +652,11 @@ class LiftArbiter {
     }
 
     this.direction = direction;
-    return this.startRun(false) ? "accepted" : "aborted";
+    return this.startRun() ? "accepted" : "aborted";
   }
 
-  // double-press: enter/exit jog mode (entering stops any run and cancels any
-  // pending reverse — jog means "manual control now"). Entering queues a short
-  // confirmation burst in the pressed direction so the rider gets feedback.
-  toggleJogMode(direction: Direction | null): string {
-    this.jogMode = !this.jogMode;
-    this.log("jog mode " + (this.jogMode ? "ON (hold-to-run)" : "OFF"));
-
-    if (this.jogMode) {
-      this.reverseTo = null;
-      this.burstTo = direction;
-    } else {
-      this.burstTo = null;
-    }
-
-    if (this.state === MachineState.Running) {
-      this.stopRun(this.jogMode ? "jog entry" : "jog exit");
-    } else if (this.jogMode && this.state === MachineState.Idle && direction !== null) {
-      this.cooldown(); // route the burst through the pump's quiescence checks
-    }
-
-    return this.jogMode ? "jog-on" : "jog-off";
-  }
-
-  // jog mode press: run unlatched while held (release stops it)
-  jogPress(direction: Direction): string {
-    if (this.state === MachineState.Running) {
-      if (direction !== this.direction) {
-        this.reverseTo = null; // no auto-reverse in jog: just stop
-        this.stopRun("jog: opposite press");
-        return "stopped";
-      }
-
-      return "ignored";
-    }
-
-    if (this.state !== MachineState.Idle) return "busy";
-
-    if (this.rogueOutputOn()) {
-      this.fault("output ON while believed IDLE");
-      return "fault";
-    }
-
-    if (this.outputOn(Direction.Up) || this.outputOn(Direction.Down)) return "settling";
-
-    if (this.inputOn(this.opposite(direction))) return "conflict";
-
-    this.direction = direction;
-    return this.startRun(true) ? "accepted" : "aborted";
-  }
-
-  // holdToRun=true: jog (release stops); firmware Auto-Off still backs it up
-  startRun(holdToRun: boolean): boolean {
+  // Firmware Auto-Off still backs up every run, latched or held.
+  startRun(): boolean {
     if (this.outputOn(Direction.Up) || this.outputOn(Direction.Down)) {
       if (this.rogueOutputOn()) {
         this.fault("output ON at run start");
@@ -801,12 +675,14 @@ class LiftArbiter {
     this.runStartedAt = Date.now();
     this.lastRunDirection = this.direction;
     this.expectedOnEcho = this.direction;
+    this.pendingTerminal = null; // new motion supersedes stale conclusions
+    this.pendingFloorCheck = false;
     this.setPosition(Position.Mid); // persisted before energizing
     this.setOutput(this.direction as Direction, true);
     this.log(
       "RUNNING " +
       DIRECTION_NAME[this.direction as Direction] +
-      (this.calibrating ? " (calibration)" : holdToRun ? " (jog hold)" : ""),
+      (this.calibrating ? " (calibration)" : ""),
     );
 
     return true;
@@ -823,16 +699,15 @@ class LiftArbiter {
       this.holdEscapeTimer = null;
     }
 
-    // jog hold-to-run: release of the running direction stops the run
-    // (except the confirmation burst, which is script-owned)
+    // push semantics: a run whose paddle was held >= HOLD_JOG_MS stops on
+    // release (a quick tap latches; releases can't touch a calibration ride)
     if (
-      this.jogMode &&
       !this.calibrating &&
-      !this.bursting &&
       this.state === MachineState.Running &&
-      direction === this.direction
+      direction === this.direction &&
+      Date.now() - this.runStartedAt >= CFG.HOLD_JOG_MS
     ) {
-      this.stopRun("jog release");
+      this.stopRun("push release");
     }
   }
 
@@ -847,7 +722,8 @@ class LiftArbiter {
       return;
     }
 
-    this.atTerminal(direction, "S3 feedback");
+    this.pendingTerminal = direction; // declared by the pump (stack headroom)
+    this.pendingTerminalWhy = "S3 feedback";
 
     if (this.calibrating) {
       this.calibrating = false;
@@ -890,7 +766,7 @@ class LiftArbiter {
 
     if (this.expectingOffEcho) {
       this.expectingOffEcho = false;
-      this.declareFloorFromEstimate();
+      this.pendingFloorCheck = true; // pump declares (stack headroom)
       return;
     }
 
@@ -899,7 +775,8 @@ class LiftArbiter {
     if (source === "timer") {
       // firmware Auto-Off: the run drove onto its limit
       this.log("Auto-Off end of run");
-      this.atTerminal(id, "Auto-Off");
+      this.pendingTerminal = id;
+      this.pendingTerminalWhy = "Auto-Off";
 
       if (this.calibrating) {
         this.calibrating = false;
@@ -915,7 +792,7 @@ class LiftArbiter {
         this.log("calibration aborted by external stop");
       }
 
-      this.declareFloorFromEstimate();
+      this.pendingFloorCheck = true;
     }
 
     this.cooldown();
@@ -959,6 +836,8 @@ class LiftArbiter {
     this.direction = id;
     this.commandedOn[id] = true; // sync intent with reality
     this.reverseTo = null; // any pending reversal is superseded
+    this.pendingTerminal = null;
+    this.pendingFloorCheck = false;
     this.runStartedAt = Date.now();
     this.lastRunDirection = id;
     this.expectedOnEcho = null;
@@ -1045,10 +924,10 @@ class LiftArbiter {
     }
 
     this.log(
-      "armed — rev13 jog-burst, cooldown " +
+      "armed — rev14 push-jog, cooldown " +
       CFG.COOLDOWN_MS +
-      "ms (tick-confirmed), chain " +
-      CFG.CHAIN_MS +
+      "ms (tick-confirmed), hold-to-jog " +
+      CFG.HOLD_JOG_MS +
       "ms, travel " +
       CFG.TRAVEL_UP_MS / 1000 +
       "s/" +
@@ -1094,7 +973,7 @@ Shelly.addStatusHandler(
   }),
 );
 
-// http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|calibrate|reset|jog|hist | ?set=top|bottom|mid
+// http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|calibrate|reset|hist | ?set=top|bottom|mid
 HTTPServer.registerEndpoint("lift", (request, response) => {
   var query = request.query ? request.query : "";
   var result = "status";
@@ -1116,8 +995,6 @@ HTTPServer.registerEndpoint("lift", (request, response) => {
     } else if (query.indexOf("cmd=reset") !== -1) {
       arbiter.hardReset("http");
       result = "reset";
-    } else if (query.indexOf("cmd=jog") !== -1) {
-      result = arbiter.toggleJogMode(null); // no direction: no confirmation burst
     } else if (query.indexOf("cmd=hist") !== -1) {
       result = "hist";
     } else if (query.indexOf("dir=up") !== -1) {
@@ -1150,7 +1027,6 @@ HTTPServer.registerEndpoint("lift", (request, response) => {
     result: string;
     state: MachineState;
     dir: string | null;
-    jog: boolean;
     calib: boolean;
     pos: Position;
     pct: number | null;
@@ -1160,7 +1036,6 @@ HTTPServer.registerEndpoint("lift", (request, response) => {
     result: result,
     state: arbiter.state,
     dir: arbiter.direction === null ? null : DIRECTION_NAME[arbiter.direction],
-    jog: arbiter.jogMode,
     calib: arbiter.calibrating || arbiter.calibrationPending,
     pos: arbiter.position,
     pct: arbiter.estimate === null ? null : Math.round(arbiter.estimate * 100),
