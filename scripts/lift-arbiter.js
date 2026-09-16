@@ -6,20 +6,26 @@
 // O1 (switch:0) = J6 UP, O2 (switch:1) = J6 DOWN.
 // S1 (input:0)  = any physical UP request, S2 (input:1) = any physical DOWN.
 // Inputs must be type "switch", in_mode "detached", initial_state "off".
+//
+// ARCHITECTURE RULE (hard-won): mJS has a tiny call stack and fw 2.0.0
+// clobbers params of Shelly.call dispatched in the same tick. Handlers and
+// helpers may ONLY mutate memory; ALL RPC I/O is emitted by ONE flat repeating
+// timer (tick), at most one call per tick.
 
 var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  TAP_MS: 400, // press shorter than this = tap (arms the double-press)
-  DBL_MS: 500, // gesture window: chained presses must land within 0.5 s
+  DBL_MS: 500, // gesture chain: next press within 0.5 s of the previous
+  TICK_MS: 25, // I/O drain tick
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
   EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
+  OFF_GRACE_MS: 2000, // commanded-OFF may lag this long before it's "rogue"
   RESET_HOLD_MS: 3000, // hold UP+DOWN together this long = state reset
   LIMIT_IN: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
-  POS_KEY: "lift.pos", // KVS key for persisted position
-  EST_KEY: "lift.est", // KVS key for persisted travel estimate
-  LOG_KEY: "lift.blackbox", // KVS: last hist lines, survives script restarts
+  POS_KEY: "lift.pos",
+  EST_KEY: "lift.est",
+  LOG_KEY: "lift.blackbox",
   HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
 };
 
@@ -30,17 +36,11 @@ var DIR_NAME = ["UP", "DOWN"];
 var S = {
   state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  calib: false, // calibration ride: full UP, paddle inputs ignored until Auto-Off
+  calib: false, // calibration ride: full UP, paddle ignored until Auto-Off
   calibPending: false, // start the calibration UP trip when cooldown re-arms
-  latched: false, // RUNNING: true = latched trip, false = hold-to-run
-  forceLatch: false, // double-press detected at request time: latch this trip
-  lastTapDir: null, // last quick tap / stop press: arms the double-press
-  lastTapTs: 0,
-  seqN: 0, // rapid same-direction press chain (3 = calibration)
-  seqDir: null,
+  seqN: 0, // rapid press chain: 1=run, 2=stop, 3=calibrate
   seqTs: 0,
-  pressTs: 0,
-  runOnTs: 0, // when the output actually energized (dead reckoning)
+  runOnTs: 0, // when the output energized (dead reckoning)
   lastRunDir: null,
   onPending: null, // switch id whose commanded-ON status echo is still in flight
   cmd: [false, false], // commanded output intent (hardware lags via the queue)
@@ -55,17 +55,123 @@ var S = {
   pos: "unknown", // top | bottom | mid | unknown
 };
 
+// ---------- flat I/O layer (memory in handlers, RPC only from the tick) ----
+
+var IO = {
+  relay: [], // FIFO of {id, on, r} Switch.Set commands — order is sacred
+  jobs: [], // one-shot RPC jobs with callbacks (init KVS.Gets)
+  dirtyPos: false,
+  dirtyEst: false,
+  dirtyBB: false,
+  whQueue: [], // webhook URLs pending delivery
+  inflight: 0,
+};
+
 function log(msg) {
   print("[lift] " + msg);
   S.hist.push(Math.round(Date.now() / 1000) + " " + msg);
   if (S.hist.length > 15) S.hist.splice(0, 1);
-  // black box: persist the tail so a script restart can't destroy evidence
-  rpc(
-    "KVS.Set",
-    { key: CFG.LOG_KEY, value: S.hist.join(" | ").slice(-250) },
-    "kvs blackbox",
-  );
+  IO.dirtyBB = true; // persisted by the tick; NO calls from here
 }
+
+function setOut(id, on) {
+  S.cmd[id] = on; // intent, set synchronously; hardware lags by queue ticks
+  if (!on) S.offTs[id] = Date.now();
+  IO.relay.push({ id: id, on: on, r: 0 });
+}
+
+function bothOff() {
+  setOut(UP, false);
+  setOut(DOWN, false);
+}
+
+// physically ON with no command intent and no recent OFF still landing
+function rogueOn() {
+  for (var i = UP; i <= DOWN; i++) {
+    if (outOn(i) && !S.cmd[i] && Date.now() - S.offTs[i] > CFG.OFF_GRACE_MS)
+      return true;
+  }
+  return false;
+}
+
+function setPos(p) {
+  if (S.pos === p) return;
+  S.pos = p;
+  log("position: " + p);
+  IO.dirtyPos = true;
+  // Two occupancy sensors in Homebridge; mid/unknown = both clear
+  IO.whQueue = [
+    CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (p === "top"),
+    CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (p === "bottom"),
+  ];
+}
+
+function setEst(e) {
+  S.est = e;
+  IO.dirtyEst = true;
+}
+
+// the tick: dispatch AT MOST one RPC per pass; relay commands first
+Timer.set(CFG.TICK_MS, true, function () {
+  var j = null;
+  if (IO.relay.length > 0 && IO.inflight < 4) {
+    var rc = IO.relay.splice(0, 1)[0];
+    j = { m: "Switch.Set", p: { id: rc.id, on: rc.on }, kind: "relay", rc: rc };
+  } else if (IO.inflight >= 2) {
+    return; // non-relay I/O keeps 2 slots of headroom below the fw cap
+  } else if (IO.jobs.length > 0) {
+    j = IO.jobs.splice(0, 1)[0];
+    j.kind = "job";
+  } else if (IO.dirtyPos) {
+    IO.dirtyPos = false;
+    j = { m: "KVS.Set", p: { key: CFG.POS_KEY, value: S.pos }, kind: "pos" };
+  } else if (IO.dirtyEst) {
+    IO.dirtyEst = false;
+    var v = "";
+    if (S.est !== null) v = JSON.stringify(S.est);
+    j = { m: "KVS.Set", p: { key: CFG.EST_KEY, value: v }, kind: "est" };
+  } else if (IO.whQueue.length > 0) {
+    var u = IO.whQueue.splice(0, 1)[0];
+    j = { m: "HTTP.GET", p: { url: u, timeout: 3 }, kind: "wh" };
+  } else if (IO.dirtyBB) {
+    IO.dirtyBB = false;
+    j = {
+      m: "KVS.Set",
+      p: { key: CFG.LOG_KEY, value: S.hist.join(" | ").slice(-250) },
+      kind: "bb",
+    };
+  } else {
+    return;
+  }
+
+  IO.inflight++;
+  try {
+    Shelly.call(
+      j.m,
+      j.p,
+      function (r, ec, em, ud) {
+        IO.inflight--;
+        if (ec !== 0 && ud.kind === "relay") {
+          ud.rc.r++;
+          if (ud.rc.r <= 2) IO.relay.unshift(ud.rc); // idempotent retry
+          else log("relay failed: " + em + " id=" + ud.rc.id);
+        } else if (ec !== 0 && ud.kind === "pos") IO.dirtyPos = true;
+        else if (ec !== 0 && ud.kind === "est") IO.dirtyEst = true;
+        if (ud.cb) ud.cb(r, ec, em);
+      },
+      j,
+    );
+  } catch (e) {
+    IO.inflight--;
+    if (j.kind === "relay") IO.relay.unshift(j.rc);
+    else if (j.kind === "job") IO.jobs.unshift(j);
+    else if (j.kind === "pos") IO.dirtyPos = true;
+    else if (j.kind === "est") IO.dirtyEst = true;
+    else if (j.kind === "bb") IO.dirtyBB = true;
+  }
+});
+
+// ---------- helpers ----------
 
 // Any uncaught exception in a handler must degrade to FAULT (outputs OFF,
 // buttons in lockout) instead of a dead script with dead detached inputs.
@@ -93,124 +199,6 @@ function inOn(id) {
   return st !== null && st.state === true;
 }
 
-function setOut(id, on) {
-  S.cmd[id] = on; // intent, set synchronously; hardware lags by queue ticks
-  if (!on) S.offTs[id] = Date.now();
-  rpcUrgent("Switch.Set", { id: id, on: on }, "switch");
-}
-
-// physically ON with no command intent and no recent OFF still landing
-function rogueOn() {
-  for (var i = UP; i <= DOWN; i++) {
-    if (outOn(i) && !S.cmd[i] && Date.now() - S.offTs[i] > 2000) return true;
-  }
-  return false;
-}
-
-// One budget for ALL script RPC (firmware caps ~5 concurrent). Normal jobs
-// (KVS, webhooks) use ≤2 slots; urgent relay commands may push to 4 total and
-// jump the queue.
-var Q = { inflight: 0, jobs: [] };
-
-function rpc(method, params, tag, cb) {
-  enq({ m: method, p: params, t: tag, cb: cb, u: false });
-}
-
-function rpcUrgent(method, params, tag) {
-  enq({ m: method, p: params, t: tag, u: true });
-}
-
-function enq(j) {
-  if (j.t === "kvs blackbox") {
-    for (var i = 0; i < Q.jobs.length; i++) {
-      if (Q.jobs[i].t === j.t) {
-        Q.jobs[i].p = j.p; // newer snapshot supersedes the queued one
-        return;
-      }
-    }
-  }
-  if (j.u) {
-    // ahead of normals but FIFO among urgents: relay command order is sacred
-    var k = 0;
-    while (k < Q.jobs.length && Q.jobs[k].u) k++;
-    Q.jobs.splice(k, 0, j);
-  } else {
-    Q.jobs.push(j);
-  }
-}
-
-// Flat, recursion-free drain. fw 2.0.0 clobbers params of Shelly.calls
-// dispatched in the same synchronous tick, and creating timers/closures deep
-// in handler stacks overflows mJS's small stack ("Too much recursion" halted
-// the script once). So: ONE repeating timer, at most one dispatch per tick,
-// nothing dispatches from callbacks or enq.
-Timer.set(25, true, function () {
-  if (Q.jobs.length === 0) return;
-  if (Q.inflight >= (Q.jobs[0].u ? 4 : 2)) return;
-  var j = Q.jobs.splice(0, 1)[0];
-  Q.inflight++;
-  try {
-    Shelly.call(
-      j.m,
-      j.p,
-      function (r, ec, em, ud) {
-        Q.inflight--;
-        if (ec !== 0 && ud.t !== "kvs blackbox" && ud.t !== "webhook") {
-          ud.r = (ud.r || 0) + 1;
-          if (ud.r <= 2) {
-            log(ud.t + " failed (" + em + ") — retry " + ud.r);
-            enq(ud); // relay/KVS commands are idempotent
-          } else {
-            log(ud.t + " failed: " + em + " params=" + JSON.stringify(ud.p));
-          }
-        }
-        if (ud.cb && (ec === 0 || ud.r === undefined || ud.r > 2))
-          ud.cb(r, ec, em);
-      },
-      j,
-    );
-  } catch (e) {
-    Q.inflight--;
-    Q.jobs.unshift(j); // budget race with firmware: retry next tick
-  }
-});
-
-function bothOff() {
-  setOut(UP, false);
-  setOut(DOWN, false);
-}
-
-function pushPos() {
-  // Two occupancy sensors in Homebridge; mid/unknown = both clear
-  var top = S.pos === "top";
-  var bottom = S.pos === "bottom";
-  var urls = [
-    CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + JSON.stringify(top),
-    CFG.HB_WEBHOOK +
-      "/?accessoryId=lift-bottom&state=" +
-      JSON.stringify(bottom),
-  ];
-  for (var i = 0; i < urls.length; i++) {
-    rpc("HTTP.GET", { url: urls[i], timeout: 3 }, "webhook");
-  }
-}
-
-function setPos(p) {
-  if (S.pos === p) return;
-  S.pos = p;
-  log("position: " + p);
-  rpc("KVS.Set", { key: CFG.POS_KEY, value: p }, "kvs pos");
-  pushPos();
-}
-
-function setEst(e) {
-  S.est = e;
-  // value precomputed: mJS mis-parses ternaries inside object literals
-  var v = "";
-  if (e !== null) v = JSON.stringify(e);
-  rpc("KVS.Set", { key: CFG.EST_KEY, value: v }, "kvs est");
-}
-
 // integrate elapsed run time into the travel estimate
 function updateEst(dirId, dtMs) {
   if (S.est === null || dtMs <= 0) return;
@@ -228,7 +216,7 @@ function atTerminal(dirId, why) {
   log("at " + (dirId === UP ? "top" : "bottom") + " (" + why + ")");
 }
 
-// after a manual stop: dead reckoning may still conclude we reached a floor
+// after a stop: dead reckoning may still conclude we reached a floor
 function declareFromEst() {
   if (S.est === null || S.pos !== "mid") return;
   if (S.est >= 1 - CFG.EST_EDGE) atTerminal(UP, "dead reckoning");
@@ -252,7 +240,6 @@ function fault(reason) {
   bothOff();
   S.state = "FAULT";
   S.dir = null;
-  S.latched = false;
   S.calib = false;
   S.calibPending = false;
 }
@@ -261,7 +248,6 @@ function cooldown() {
   clearTimers();
   S.state = "COOLDOWN";
   S.dir = null;
-  S.latched = false;
   S.cdTimer = Timer.set(
     CFG.COOLDOWN_MS,
     false,
@@ -294,29 +280,32 @@ function hardReset(source) {
   S.dir = null;
   S.calib = false;
   S.calibPending = false;
-  S.forceLatch = false;
-  S.latched = false;
-  S.lastTapDir = null;
   S.seqN = 0;
-  S.seqDir = null;
   S.stopping = false;
   S.onPending = null;
   S.runOnTs = 0;
 }
 
+function armResetGesture() {
+  if (S.resetTimer !== null) return;
+  S.resetTimer = Timer.set(
+    CFG.RESET_HOLD_MS,
+    false,
+    guard("resetTimer", function () {
+      S.resetTimer = null;
+      if (inOn(UP) && inOn(DOWN)) hardReset("both buttons held");
+    }),
+  );
+}
+
 // Calibration: full UP ride to the top limit; est becomes exactly 1 (100%).
-// Paddle inputs are IGNORED until Auto-Off completes it. Escape hatches:
-// UP+DOWN 3 s hold, ?cmd=stop, ?cmd=reset.
+// Paddle inputs are IGNORED until Auto-Off completes it, then normal service
+// resumes at top/100%. Escapes: UP+DOWN 3 s hold, ?cmd=stop, ?cmd=reset.
 function startCalibration(source) {
   log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
   S.calib = true;
-  S.lastTapDir = null;
-  S.forceLatch = false;
   if (S.state === "RUNNING") {
-    if (S.dir === UP) {
-      S.latched = true; // already heading up: this run becomes the calibration
-      return "calibrating";
-    }
+    if (S.dir === UP) return "calibrating"; // already riding up: this run is it
     S.calibPending = true;
     stopTrip("calibration: stop before UP ride");
     return "calibrating";
@@ -343,19 +332,11 @@ function startCalibTrip() {
   }
 }
 
-function armResetGesture() {
-  if (S.resetTimer !== null) return;
-  S.resetTimer = Timer.set(
-    CFG.RESET_HOLD_MS,
-    false,
-    guard("resetTimer", function () {
-      S.resetTimer = null;
-      if (inOn(UP) && inOn(DOWN)) hardReset("both buttons held");
-    }),
-  );
-}
+// ---------- state machine ----------
 
 // Single entry point for ALL request sources (physical inputs, HTTP/HomeKit).
+// Gestures (rev 8): single press = latched full run. During a run a lone press
+// is ignored; a chained 2nd press (≤ DBL_MS) stops; a chained 3rd = calibration.
 function request(dir, source) {
   // reset gesture works from ANY state, including FAULT
   if (source === "input" && inOn(UP) && inOn(DOWN)) armResetGesture();
@@ -372,29 +353,28 @@ function request(dir, source) {
   }
 
   if (source === "input") {
-    log("press " + DIR_NAME[dir] + " (" + S.state + ")");
-    // three rapid presses from idle = calibration; a stop of an older trip
-    // breaks the chain so stop/resume/stop fiddling can never trigger it
-    var chained = S.seqDir === dir && Date.now() - S.seqTs <= CFG.DBL_MS;
-    S.seqDir = dir;
+    var chained = Date.now() - S.seqTs <= CFG.DBL_MS;
     S.seqTs = Date.now();
-    if (S.state === "RUNNING" && Date.now() - S.runOnTs > CFG.DBL_MS)
+    S.seqN = chained ? S.seqN + 1 : 1;
+    log("press " + DIR_NAME[dir] + " " + S.seqN + " (" + S.state + ")");
+    if (S.seqN === 3) {
       S.seqN = 0;
-    else S.seqN = chained ? S.seqN + 1 : 1;
-    if (S.seqN >= 3) {
-      S.seqN = 0;
-      S.seqDir = null;
       return startCalibration(source);
     }
   }
 
   if (S.state === "RUNNING") {
-    // any press during a run = stop (never reverse); quick follow-up press
-    // in the pressed direction = latched "remaining travel"
-    S.lastTapDir = source === "input" ? dir : null;
-    S.lastTapTs = Date.now();
-    stopTrip(DIR_NAME[dir] + " press during run, " + source);
-    return "stopped";
+    if (source !== "input") {
+      stopTrip(DIR_NAME[dir] + " request during run, " + source);
+      return "stopped";
+    }
+    if (S.seqN >= 2) {
+      // double-press = deliberate interrupt
+      stopTrip("double-press interrupt");
+      return "stopped";
+    }
+    log("lone press during run ignored (double-press to stop)");
+    return "ignored";
   }
 
   if (S.state === "PENDING") {
@@ -407,32 +387,13 @@ function request(dir, source) {
     return "duplicate";
   }
 
-  // double-press: 2nd press within the window = latched full travel that way
-  var dbl =
-    source === "input" &&
-    S.lastTapDir === dir &&
-    Date.now() - S.lastTapTs <= CFG.DBL_MS;
-
-  if (S.state === "COOLDOWN") {
-    // the 2nd press usually lands in the post-tap/stop cooldown; safe to cut
-    // short for a same-direction latch
-    if (!dbl) return "busy";
-    clearTimers();
-    S.state = "IDLE";
-  }
-
-  if (S.state !== "IDLE") return "busy";
+  if (S.state !== "IDLE") return "busy"; // COOLDOWN (chain still counted above)
 
   if (rogueOn()) {
     fault("output ON while believed IDLE");
     return "fault";
   }
   if (outOn(UP) || outOn(DOWN)) {
-    // our own OFF is still landing (queue lag): keep the gesture armed
-    if (source === "input") {
-      S.lastTapDir = dir;
-      S.lastTapTs = Date.now();
-    }
     log("outputs settling — press again");
     return "settling";
   }
@@ -444,55 +405,38 @@ function request(dir, source) {
 
   S.state = "PENDING";
   S.dir = dir;
-  S.forceLatch = dbl;
-  S.lastTapDir = null;
-  log(
-    DIR_NAME[dir] +
-      " pending (" +
-      source +
-      ")" +
-      (dbl ? " [double-press]" : ""),
-  );
+  log(DIR_NAME[dir] + " pending (" + source + ")");
   S.arbTimer = Timer.set(
     CFG.ARB_MS,
     false,
     guard("arbTimer", function () {
       S.arbTimer = null;
-      startTrip(source);
+      startTrip();
     }),
   );
   return "accepted";
 }
 
-function startTrip(source) {
+function startTrip() {
   if (outOn(UP) || outOn(DOWN)) {
     if (rogueOn()) {
       fault("output ON at trip start");
     } else {
       // our own OFF command hasn't landed yet (queue lag): abort quietly
       log("outputs still settling — trip aborted, press again");
-      S.forceLatch = false;
       cooldown();
     }
     return;
   }
-  // RUNNING before energizing: a press landing between here and relay closure
-  // is treated as "press during trip" (stop), never a second acceptance.
+  // RUNNING before energizing: a chained press landing between decision and
+  // relay closure is handled as a run interrupt, never a second acceptance.
   S.state = "RUNNING";
-  // Physical single press = hold-to-run; double-press and HTTP = latched trip.
-  S.latched = S.forceLatch || source !== "input";
-  S.forceLatch = false;
-  S.pressTs = Date.now();
   S.runOnTs = Date.now();
   S.lastRunDir = S.dir;
   S.onPending = S.dir; // expect our own ON echo (may arrive after a stop)
   setPos("mid"); // persisted before energizing: power loss mid-trip never restores a floor
   setOut(S.dir, true);
-  log(
-    "RUNNING " +
-      DIR_NAME[S.dir] +
-      (S.latched ? " (latched)" : " (hold-to-run)"),
-  );
+  log("RUNNING " + DIR_NAME[S.dir] + (S.calib ? " (calibration)" : ""));
 }
 
 function release(dir) {
@@ -500,30 +444,7 @@ function release(dir) {
     Timer.clear(S.resetTimer);
     S.resetTimer = null;
   }
-  if (S.calib) return; // calibration ride ignores paddle releases too
-  if (S.state === "PENDING" && dir === S.dir && !S.forceLatch) {
-    // released inside the arbitration window — no motion, arms the double
-    clearTimers();
-    S.state = "IDLE";
-    S.dir = null;
-    S.lastTapDir = dir;
-    S.lastTapTs = Date.now();
-    log("tap " + DIR_NAME[dir] + " (press again within 1 s = full travel)");
-    return;
-  }
-  if (S.state === "RUNNING" && !S.latched && dir === S.dir) {
-    if (Date.now() - S.pressTs < CFG.TAP_MS) {
-      // quick tap (short nudge): arms the double-press
-      S.lastTapDir = dir;
-      S.lastTapTs = Date.now();
-      stopTrip(
-        "tap " + DIR_NAME[dir] + " (press again within 1 s = full travel)",
-      );
-    } else {
-      S.lastTapDir = null;
-      stopTrip("hold release");
-    }
-  }
+  // rev 8: all runs are latched; releases carry no other meaning
 }
 
 Shelly.addEventHandler(
@@ -548,6 +469,10 @@ function limitHit() {
     return;
   }
   atTerminal(d, "S3 feedback");
+  if (S.calib) {
+    S.calib = false;
+    log("CALIBRATION complete — at top, 100%");
+  }
   if (S.state === "RUNNING") {
     S.stopping = outOn(UP) || outOn(DOWN);
     bothOff(); // end the command; motion already ended at the Harmar limit
@@ -573,7 +498,7 @@ Shelly.addStatusHandler(
       }
       if (S.stopping) {
         S.stopping = false;
-        declareFromEst(); // manual stop may still have landed on a floor
+        declareFromEst(); // a stop may still have landed on a floor
         return;
       }
       if (S.state === "RUNNING" && st.id === S.dir) {
@@ -606,7 +531,9 @@ Shelly.addStatusHandler(
   }),
 );
 
-// HomeKit/remote entry: http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|reset|hist
+// ---------- remote entry ----------
+
+// http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|calibrate|reset|hist | ?set=top|bottom|mid
 HTTPServer.registerEndpoint("lift", function (req, res) {
   var q = req.query ? req.query : "";
   var result = "status";
@@ -655,7 +582,6 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     result: result,
     state: S.state,
     dir: S.dir === null ? null : DIR_NAME[S.dir],
-    latched: S.latched,
     calib: S.calib || S.calibPending,
     pos: S.pos,
     pct: S.est === null ? null : Math.round(S.est * 100),
@@ -667,40 +593,58 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
   res.send();
 });
 
+// ---------- init ----------
+
 function init() {
   bothOff(); // fail-safe regardless of pre-boot state
   S.state = "IDLE";
   S.dir = null;
   S.calib = false;
   S.calibPending = false;
-  S.forceLatch = false;
-  S.latched = false;
+  S.stopping = false;
 
   // est restore chained after pos restore: its fallback derives from S.pos
-  rpc("KVS.Get", { key: CFG.POS_KEY }, "kvs get pos", function (r, ec) {
-    if (ec === 0 && r && typeof r.value === "string") S.pos = r.value;
-    log("position restored: " + S.pos);
-    pushPos(); // sync Homebridge sensors with reality at boot
-    rpc("KVS.Get", { key: CFG.EST_KEY }, "kvs get est", function (r2, ec2) {
-      if (ec2 === 0 && r2 && r2.value !== "" && typeof r2.value === "string") {
-        var e = JSON.parse(r2.value);
-        if (typeof e === "number") S.est = e;
-      }
-      if (S.est === null) {
-        // older deploys persisted pos only
-        if (S.pos === "top") S.est = 1;
-        else if (S.pos === "bottom") S.est = 0;
-      }
-      log("est restored: " + (S.est === null ? "null" : S.est));
-    });
+  IO.jobs.push({
+    m: "KVS.Get",
+    p: { key: CFG.POS_KEY },
+    cb: function (r, ec) {
+      if (ec === 0 && r && typeof r.value === "string") S.pos = r.value;
+      log("position restored: " + S.pos);
+      IO.whQueue = [
+        CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (S.pos === "top"),
+        CFG.HB_WEBHOOK +
+          "/?accessoryId=lift-bottom&state=" +
+          (S.pos === "bottom"),
+      ];
+      IO.jobs.push({
+        m: "KVS.Get",
+        p: { key: CFG.EST_KEY },
+        cb: function (r2, ec2) {
+          if (
+            ec2 === 0 &&
+            r2 &&
+            r2.value !== "" &&
+            typeof r2.value === "string"
+          ) {
+            var e = JSON.parse(r2.value);
+            if (typeof e === "number") S.est = e;
+          }
+          if (S.est === null) {
+            if (S.pos === "top") S.est = 1;
+            else if (S.pos === "bottom") S.est = 0;
+          }
+          log("est restored: " + (S.est === null ? "null" : S.est));
+        },
+      });
+    },
   });
+
   var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
   S.limitFb = lc !== null && lc.enable === true;
   log(
     "S3 limit feedback: " +
       (S.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"),
   );
-  S.stopping = false;
 
   for (var i = UP; i <= DOWN; i++) {
     var c = Shelly.getComponentConfig("switch:" + i);
@@ -711,37 +655,24 @@ function init() {
         else CFG.TRAVEL_DOWN_MS = c.auto_off_delay * 1000;
       }
       if (c.initial_state !== "off")
-        log(
-          "WARN switch:" +
-            i +
-            " initial_state='" +
-            c.initial_state +
-            "' (want 'off')",
-        );
+        log("WARN switch:" + i + " initial_state='" + c.initial_state + "'");
       if (c.in_mode !== "detached")
-        log(
-          "WARN switch:" + i + " in_mode='" + c.in_mode + "' (want 'detached')",
-        );
-      if (!c.auto_off)
-        log(
-          "WARN switch:" +
-            i +
-            " auto_off DISABLED (firmware backstop required)",
-        );
+        log("WARN switch:" + i + " in_mode='" + c.in_mode + "'");
+      if (!c.auto_off) log("WARN switch:" + i + " auto_off DISABLED");
     }
   }
   log(
-    "armed — arbitration " +
+    "armed — arb " +
       CFG.ARB_MS +
       "ms, cooldown " +
       CFG.COOLDOWN_MS +
-      "ms, gesture window " +
+      "ms, chain " +
       CFG.DBL_MS +
       "ms, travel " +
       CFG.TRAVEL_UP_MS / 1000 +
-      "s up / " +
+      "s/" +
       CFG.TRAVEL_DOWN_MS / 1000 +
-      "s down (from auto_off_delay)",
+      "s (from auto_off_delay)",
   );
 }
 

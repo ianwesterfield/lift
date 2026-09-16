@@ -34,31 +34,37 @@ O3/S3 unused/reserved
 
 Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip, the active output still turns off at 55/45 s. The script must never re-issue `Switch.Set on` to extend a trip.
 
-## Behavior specification (modeless, rev 6)
+## Behavior specification (rev 8)
 
-States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. **No jog mode flag** — hold-to-run is the default interaction; a double-press latches. The second press of a double must land within 1 s.
+States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. All runs are latched — releases carry no meaning. **Chained presses must land within 0.5 s of the previous press.**
 
-| Gesture                                              | Result                                                                         |
+| Gesture                                              | Result                                                                        |
 | ---------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Press and **hold**                                   | Runs while held (starts after 75 ms arbitration); release = stop               |
-| Quick **tap** (< 400 ms)                             | Nudge at most (nothing if released within 75 ms); arms the double-press        |
-| **Double-press** (2nd press ≤ 1 s, same direction)   | **Latched full travel that direction, immediately** (Auto-Off/limits end it)   |
-| **Any** press during a latched trip                  | **STOP** (never reverse); quick press again = resume remaining travel that way |
+| **Single press** (idle)                              | Latched full run that direction (starts after 75 ms arbitration)               |
+| Lone press during a run                              | Ignored — interrupting must be deliberate                                      |
+| **Double-press** (2nd press ≤ 0.5 s, any direction)  | **Interrupt: stop the run** (never reverse); single press after = new full run |
+| **Triple-press** (3 chained presses)                 | **Calibration**: full-UP ride, paddle IGNORED until Auto-Off → top / 100%      |
 | Opposite press within the 75 ms arbitration window   | Cancelled, neither output fires, cooldown                                      |
 | Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                 |
-| Hold **UP+DOWN 3 s**                                 | Hard reset from any state (incl. FAULT); keeps position                        |
+| Hold **UP+DOWN 3 s**                                 | Hard reset from any state (incl. FAULT and calibration); keeps position        |
 
-HTTP/HomeKit `?dir=` requests are always latched full trips.
+Calibration exits back to normal service automatically when the ride completes at the top. Triple on the DOWN paddle stops the run, waits out the cooldown, then rides UP. Escapes during the locked ride: UP+DOWN hold, `?cmd=stop`, `?cmd=reset`. Note: a 3rd chained press right after a double-press interrupt IS the calibration gesture — pause > 0.5 s after an interrupt before commanding a new run.
+
+HTTP/HomeKit `?dir=` requests are always latched full runs; `?cmd=calibrate` triggers the calibration ride.
+
+### Plumbing rule (hard-won, three field crashes)
+
+mJS has a tiny call stack, fw 2.0.0 clobbers params of `Shelly.call`s dispatched in the same tick, and caps ~5 concurrent calls. Therefore: **handlers and helpers only mutate memory; ALL RPC I/O is emitted by one flat repeating 25 ms tick**, at most one call per pass — relay FIFO first (order sacred, ≤4 in flight), then KVS/webhook syncs from dirty flags (≤2 in flight). Relay commands retry twice; KVS syncs re-dirty on failure; the blackbox write coalesces naturally.
 
 ### Invariants
 
 1. O1 and O2 never ON simultaneously — verified before every trip _and_ watched via status handler.
 2. State transitions to RUNNING **before** the relay is commanded ON (no accept-both race).
 3. `Switch.Set` only; never `Switch.Toggle`.
-4. 400 ms cooldown after any stop before re-arm (same-direction double-press may cut it short — the relay was just conducting that direction).
+4. 400 ms cooldown after any stop before re-arm.
 5. Boot: both outputs forced OFF, state IDLE.
 6. Trip refused if the opposite input is currently held (stuck button / welded Phoenix contact).
-7. If both outputs are ever observed ON, or an output is ON when the arbiter believes it shouldn't be: force both OFF and enter **FAULT lockout** (cleared only by `cmd=reset`, the UP+DOWN hold, or script restart).
+7. Command-intent tracking (`cmd[]` + 2 s OFF grace): queue lag never false-FAULTs, but a genuinely rogue output (direct RPC bypass, welded relay) forces both OFF and enters **FAULT lockout** (cleared only by `cmd=reset`, the UP+DOWN hold, or script restart).
 
 ### Race handling
 
