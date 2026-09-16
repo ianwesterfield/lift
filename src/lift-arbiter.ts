@@ -1,6 +1,6 @@
 // lift-arbiter.ts — Harmar Highlander II motion arbiter (Shelly Pro 3 "Lift")
-// Source of truth: this TypeScript. Build with `npm run build` -> scripts/lift-arbiter.js
-// (ES5, script-mode, no modules/helpers — the device runs mJS).
+// Source of truth. Build: `npm run build` -> scripts/lift-arbiter.js (ES5,
+// script-mode, no modules, no emitted helpers — the device runs mJS).
 //
 // Supervisory convenience logic ONLY. The Harmar controller owns all safety,
 // interlocks and travel limits. Firmware Auto-Off (UP 55s / DOWN 45s) is the
@@ -8,17 +8,50 @@
 //
 // O1 (switch:0) = J6 UP, O2 (switch:1) = J6 DOWN.
 // S1 (input:0)  = any physical UP request, S2 (input:1) = any physical DOWN.
-// Inputs must be type "switch", in_mode "detached", initial_state "off".
+//
+// GESTURES (rev 10):
+//   idle press            -> latched full travel (energized immediately)
+//   opposite press in run -> REVERSE: stop, dead-time, full travel other way
+//   same-dir 2nd press    -> toggle JOG MODE (stops the run on entry)
+//     (chain: presses within 3 s of the chain's FIRST press, same direction)
+//   same-dir 3rd press    -> CALIBRATION ride (full UP, paddle locked)
+//   jog mode              -> hold-to-run; double-press exits back to normal
+//   hold paddle 3 s       -> lockout escape (FAULT/calibration only)
 //
 // ARCHITECTURE RULE (hard-won): mJS has a tiny call stack and fw 2.0.0
 // clobbers params of Shelly.call dispatched in the same tick. Handlers and
 // helpers may ONLY mutate memory; ALL RPC I/O is emitted by ONE flat repeating
-// timer (tick), at most one call per tick.
+// timer (the IoQueue tick), at most one call per tick. No class inheritance,
+// no accessors, no spread: those emit ES5 helpers the device cannot run.
 
 type Dir = 0 | 1;
 type MachineState = "IDLE" | "RUNNING" | "COOLDOWN" | "FAULT";
 type Pos = "top" | "bottom" | "mid" | "unknown";
 type Source = "input" | "http" | "calib" | "reverse";
+type Gesture = "run" | "jogToggle" | "calibrate";
+
+var UP: Dir = 0;
+var DOWN: Dir = 1;
+var DIR_NAME = ["UP", "DOWN"];
+
+var CFG = {
+  COOLDOWN_MS: 400, // stop -> reverse/re-arm dead-time
+  DBL_MS: 3000, // gesture chain: presses within 3 s of the chain's first press
+  TICK_MS: 25, // I/O drain tick
+  TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
+  TRAVEL_DOWN_MS: 45000,
+  EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
+  OFF_GRACE_MS: 2000, // commanded-OFF may lag this long before it's "rogue"
+  RESET_HOLD_MS: 3000, // lockout-escape hold duration
+  LIMIT_IN: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
+  POS_KEY: "lift.pos",
+  EST_KEY: "lift.est",
+  LOG_KEY: "lift.blackbox",
+  HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyFn = (a?: any, b?: any, c?: any, d?: any) => void;
 
 interface RelayCmd {
   id: Dir;
@@ -32,575 +65,586 @@ type IoJob =
   | { kind: "pos" | "est" | "bb"; m: "KVS.Set"; p: { key: string; value: string } }
   | { kind: "wh"; m: "HTTP.GET"; p: { url: string; timeout: number } };
 
-var CFG = {
-  COOLDOWN_MS: 400, // dead-time after any stop before re-arm
-  DBL_MS: 3000, // gesture chain: ALL presses within 3 s of the chain's first press
-  TICK_MS: 25, // I/O drain tick
-  TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
-  TRAVEL_DOWN_MS: 45000,
-  EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
-  OFF_GRACE_MS: 2000, // commanded-OFF may lag this long before it's "rogue"
-  RESET_HOLD_MS: 3000, // hold gesture duration for reset/lockout escape
-  LIMIT_IN: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
-  POS_KEY: "lift.pos",
-  EST_KEY: "lift.est",
-  LOG_KEY: "lift.blackbox",
-  HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
-};
+// ---------------------------------------------------------------------------
+// IoQueue — the ONLY place Shelly.call happens. Everything else raises
+// signals: relay FIFO, one-shot jobs, dirty flags, webhook queue. The tick
+// drains at most one call per pass (fw clobbers same-tick dispatches) with
+// budget headroom under the ~5 concurrent-call cap.
+// ---------------------------------------------------------------------------
 
-var UP: Dir = 0;
-var DOWN: Dir = 1;
-var DIR_NAME = ["UP", "DOWN"];
+class IoQueue {
+  relay: RelayCmd[] = []; // FIFO — relay command order is sacred
+  jobs: IoJob[] = [];
+  dirtyPos = false;
+  dirtyEst = false;
+  dirtyBB = false;
+  whQueue: string[] = [];
+  inflight = 0;
 
-interface ArbiterState {
-  state: MachineState;
-  dir: Dir | null;
-  calib: boolean; // calibration ride: full UP, paddle ignored until Auto-Off
-  calibPending: boolean; // start the calibration UP trip when cooldown re-arms
-  seqN: number; // same-direction press chain within DBL_MS of its first press
-  seqDir: Dir | null;
-  seqStartTs: number;
-  nextDir: Dir | null; // reversal: direction to auto-start after the cooldown
-  runOnTs: number; // when the output energized (dead reckoning)
-  lastRunDir: Dir | null;
-  onPending: Dir | null; // switch id whose commanded-ON status echo is in flight
-  cmd: [boolean, boolean]; // commanded output intent (hardware lags via the queue)
-  offTs: [number, number]; // when each OFF was commanded (grace for queue lag)
-  est: number | null; // 0=bottom..1=top travel estimate; null until known
-  stopping: boolean; // we commanded OFF; swallow the resulting status event
-  cdTimer: number | null;
-  resetTimer: number | null;
-  holdTimer: number | null; // single-paddle lockout-escape hold
-  limitFb: boolean; // S3 hardware limit feedback available
-  hist: string[]; // ring buffer of recent log lines for ?cmd=hist
-  pos: Pos;
-}
+  private owner: LiftArbiter | null = null;
 
-var S: ArbiterState = {
-  state: "IDLE",
-  dir: null,
-  calib: false,
-  calibPending: false,
-  seqN: 0,
-  seqDir: null,
-  seqStartTs: 0,
-  nextDir: null,
-  runOnTs: 0,
-  lastRunDir: null,
-  onPending: null,
-  cmd: [false, false],
-  offTs: [0, 0],
-  est: null,
-  stopping: false,
-  cdTimer: null,
-  resetTimer: null,
-  holdTimer: null,
-  limitFb: false,
-  hist: [],
-  pos: "unknown",
-};
-
-// ---------- flat I/O layer (memory in handlers, RPC only from the tick) ----
-
-interface IoState {
-  relay: RelayCmd[]; // FIFO of Switch.Set commands — order is sacred
-  jobs: IoJob[]; // one-shot RPC jobs with callbacks (init KVS.Gets)
-  dirtyPos: boolean;
-  dirtyEst: boolean;
-  dirtyBB: boolean;
-  whQueue: string[]; // webhook URLs pending delivery
-  inflight: number;
-}
-
-var IO: IoState = {
-  relay: [],
-  jobs: [],
-  dirtyPos: false,
-  dirtyEst: false,
-  dirtyBB: false,
-  whQueue: [],
-  inflight: 0,
-};
-
-function log(msg: string): void {
-  print("[lift] " + msg);
-  S.hist.push(Math.round(Date.now() / 1000) + " " + msg);
-  if (S.hist.length > 15) S.hist.splice(0, 1);
-  IO.dirtyBB = true; // persisted by the tick; NO calls from here
-}
-
-function setOut(id: Dir, on: boolean): void {
-  S.cmd[id] = on; // intent, set synchronously; hardware lags by queue ticks
-  if (!on) S.offTs[id] = Date.now();
-  IO.relay.push({ id: id, on: on, r: 0 });
-}
-
-function bothOff(): void {
-  setOut(UP, false);
-  setOut(DOWN, false);
-}
-
-function outOn(id: Dir): boolean {
-  var st = Shelly.getComponentStatus("switch:" + id);
-  return st !== null && st.output === true;
-}
-
-function inOn(id: Dir): boolean {
-  var st = Shelly.getComponentStatus("input:" + id);
-  return st !== null && st.state === true;
-}
-
-// physically ON with no command intent and no recent OFF still landing
-function rogueOn(): boolean {
-  for (var i = UP; i <= DOWN; i++) {
-    var d = i as Dir;
-    if (outOn(d) && !S.cmd[d] && Date.now() - S.offTs[d] > CFG.OFF_GRACE_MS)
-      return true;
-  }
-  return false;
-}
-
-function setPos(p: Pos): void {
-  if (S.pos === p) return;
-  S.pos = p;
-  log("position: " + p);
-  IO.dirtyPos = true;
-  // Two occupancy sensors in Homebridge; mid/unknown = both clear
-  IO.whQueue = [
-    CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (p === "top"),
-    CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (p === "bottom"),
-  ];
-}
-
-function setEst(e: number | null): void {
-  S.est = e;
-  IO.dirtyEst = true;
-}
-
-// the tick: dispatch AT MOST one RPC per pass; relay commands first
-Timer.set(CFG.TICK_MS, true, function () {
-  var j: IoJob;
-  if (IO.relay.length > 0 && IO.inflight < 4) {
-    var rc = IO.relay.splice(0, 1)[0];
-    j = { m: "Switch.Set", p: { id: rc.id, on: rc.on }, kind: "relay", rc: rc };
-  } else if (IO.inflight >= 2) {
-    return; // non-relay I/O keeps 2 slots of headroom below the fw cap
-  } else if (IO.jobs.length > 0) {
-    j = IO.jobs.splice(0, 1)[0];
-  } else if (IO.dirtyPos) {
-    IO.dirtyPos = false;
-    j = { m: "KVS.Set", p: { key: CFG.POS_KEY, value: S.pos }, kind: "pos" };
-  } else if (IO.dirtyEst) {
-    IO.dirtyEst = false;
-    var v = "";
-    if (S.est !== null) v = JSON.stringify(S.est);
-    j = { m: "KVS.Set", p: { key: CFG.EST_KEY, value: v }, kind: "est" };
-  } else if (IO.whQueue.length > 0) {
-    var u = IO.whQueue.splice(0, 1)[0];
-    j = { m: "HTTP.GET", p: { url: u, timeout: 3 }, kind: "wh" };
-  } else if (IO.dirtyBB) {
-    IO.dirtyBB = false;
-    j = {
-      m: "KVS.Set",
-      p: { key: CFG.LOG_KEY, value: S.hist.join(" | ").slice(-250) },
-      kind: "bb",
-    };
-  } else {
-    return;
+  attach(owner: LiftArbiter): void {
+    this.owner = owner;
+    var self = this;
+    Timer.set(CFG.TICK_MS, true, function () {
+      self.tick();
+    });
   }
 
-  IO.inflight++;
-  try {
-    Shelly.call(
-      j.m,
-      j.p,
-      function (r, ec, em, ud) {
-        IO.inflight--;
-        var job = ud as IoJob;
-        if (ec !== 0 && job.kind === "relay") {
-          job.rc.r++;
-          if (job.rc.r <= 2)
-            IO.relay.unshift(job.rc); // idempotent retry
-          else log("relay failed: " + em + " id=" + job.rc.id);
-        } else if (ec !== 0 && job.kind === "pos") IO.dirtyPos = true;
-        else if (ec !== 0 && job.kind === "est") IO.dirtyEst = true;
-        if (job.kind === "job" && job.cb) job.cb(r, ec, em);
-      },
-      j,
-    );
-  } catch (e) {
-    IO.inflight--;
-    if (j.kind === "relay") IO.relay.unshift(j.rc);
-    else if (j.kind === "job") IO.jobs.unshift(j);
-    else if (j.kind === "pos") IO.dirtyPos = true;
-    else if (j.kind === "est") IO.dirtyEst = true;
-    else if (j.kind === "bb") IO.dirtyBB = true;
+  pushRelay(id: Dir, on: boolean): void {
+    this.relay.push({ id: id, on: on, r: 0 });
   }
-});
 
-// ---------- helpers ----------
+  pushJob(m: string, p: object, cb?: (r: unknown, ec: number, em: string) => void): void {
+    this.jobs.push({ kind: "job", m: m, p: p, cb: cb });
+  }
 
-// Any uncaught exception in a handler must degrade to FAULT (outputs OFF,
-// buttons in lockout) instead of a dead script with dead detached inputs.
-// Fixed 4-arg form (mJS `arguments`/`apply` not trusted); explicit any so the
-// wrapper is assignable to every handler/timer callback shape.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyFn = (a?: any, b?: any, c?: any, d?: any) => void;
+  private nextJob(): IoJob | null {
+    var o = this.owner as LiftArbiter;
+    if (this.relay.length > 0 && this.inflight < 4) {
+      var rc = this.relay.splice(0, 1)[0];
+      return { m: "Switch.Set", p: { id: rc.id, on: rc.on }, kind: "relay", rc: rc };
+    }
+    if (this.inflight >= 2) return null; // headroom below the fw call cap
+    if (this.jobs.length > 0) return this.jobs.splice(0, 1)[0];
+    if (this.dirtyPos) {
+      this.dirtyPos = false;
+      return { m: "KVS.Set", p: { key: CFG.POS_KEY, value: o.pos }, kind: "pos" };
+    }
+    if (this.dirtyEst) {
+      this.dirtyEst = false;
+      var v = "";
+      if (o.est !== null) v = JSON.stringify(o.est);
+      return { m: "KVS.Set", p: { key: CFG.EST_KEY, value: v }, kind: "est" };
+    }
+    if (this.whQueue.length > 0) {
+      var u = this.whQueue.splice(0, 1)[0];
+      return { m: "HTTP.GET", p: { url: u, timeout: 3 }, kind: "wh" };
+    }
+    if (this.dirtyBB) {
+      this.dirtyBB = false;
+      return {
+        m: "KVS.Set",
+        p: { key: CFG.LOG_KEY, value: o.hist.join(" | ").slice(-250) },
+        kind: "bb",
+      };
+    }
+    return null;
+  }
 
-function guard(name: string, fn: AnyFn): AnyFn {
-  return function (a?, b?, c?, d?) {
+  private tick(): void {
+    var j = this.nextJob();
+    if (j === null) return;
+    var self = this;
+    this.inflight++;
     try {
-      fn(a, b, c, d);
+      Shelly.call(
+        j.m,
+        j.p,
+        function (r, ec, em, ud) {
+          self.inflight--;
+          var job = ud as IoJob;
+          if (ec !== 0 && job.kind === "relay") {
+            job.rc.r++;
+            if (job.rc.r <= 2)
+              self.relay.unshift(job.rc); // idempotent retry
+            else (self.owner as LiftArbiter).log("relay failed: " + em + " id=" + job.rc.id);
+          } else if (ec !== 0 && job.kind === "pos") self.dirtyPos = true;
+          else if (ec !== 0 && job.kind === "est") self.dirtyEst = true;
+          if (job.kind === "job" && job.cb) job.cb(r, ec, em);
+        },
+        j,
+      );
     } catch (e) {
+      this.inflight--;
+      if (j.kind === "relay") this.relay.unshift(j.rc);
+      else if (j.kind === "job") this.jobs.unshift(j);
+      else if (j.kind === "pos") this.dirtyPos = true;
+      else if (j.kind === "est") this.dirtyEst = true;
+      else if (j.kind === "bb") this.dirtyBB = true;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gestures — classifies physical presses into intents. Chain = same-direction
+// presses within DBL_MS of the chain's FIRST press.
+// ---------------------------------------------------------------------------
+
+class Gestures {
+  private n = 0;
+  private dir: Dir | null = null;
+  private startTs = 0;
+
+  classify(dir: Dir): { gesture: Gesture; n: number } {
+    if (this.dir === dir && Date.now() - this.startTs <= CFG.DBL_MS) {
+      this.n++;
+    } else {
+      this.n = 1;
+      this.dir = dir;
+      this.startTs = Date.now();
+    }
+    if (this.n === 3) {
+      this.reset();
+      return { gesture: "calibrate", n: 3 };
+    }
+    if (this.n === 2) return { gesture: "jogToggle", n: 2 };
+    return { gesture: "run", n: 1 };
+  }
+
+  reset(): void {
+    this.n = 0;
+    this.dir = null;
+    this.startTs = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LiftArbiter — the state machine. Handlers mutate memory only; all I/O goes
+// through the IoQueue.
+// ---------------------------------------------------------------------------
+
+class LiftArbiter {
+  state: MachineState = "IDLE";
+  dir: Dir | null = null;
+  jog = false; // hold-to-run mode; toggled by same-dir double-press
+  calib = false; // calibration ride: paddle ignored until Auto-Off
+  calibPending = false;
+  nextDir: Dir | null = null; // reversal target after cooldown
+  runOnTs = 0;
+  lastRunDir: Dir | null = null;
+  onPending: Dir | null = null; // commanded-ON echo still in flight
+  cmd: [boolean, boolean] = [false, false];
+  offTs: [number, number] = [0, 0];
+  est: number | null = null;
+  stopping = false;
+  cdTimer: number | null = null;
+  resetTimer: number | null = null;
+  holdTimer: number | null = null;
+  limitFb = false;
+  hist: string[] = [];
+  pos: Pos = "unknown";
+
+  io: IoQueue;
+  gestures: Gestures;
+
+  constructor() {
+    this.io = new IoQueue();
+    this.gestures = new Gestures();
+  }
+
+  // ---- logging / persistence signals ----
+
+  log(msg: string): void {
+    print("[lift] " + msg);
+    this.hist.push(Math.round(Date.now() / 1000) + " " + msg);
+    if (this.hist.length > 15) this.hist.splice(0, 1);
+    this.io.dirtyBB = true;
+  }
+
+  guard(name: string, fn: AnyFn): AnyFn {
+    var self = this;
+    return function (a?, b?, c?, d?) {
       try {
-        fault("exception in " + name + ": " + (e as Error).message);
-      } catch (e2) {
-        bothOff(); // last resort
-      }
-    }
-  };
-}
-
-// integrate elapsed run time into the travel estimate
-function updateEst(dirId: Dir, dtMs: number): void {
-  if (S.est === null || dtMs <= 0) return;
-  var d = dirId === UP ? dtMs / CFG.TRAVEL_UP_MS : -dtMs / CFG.TRAVEL_DOWN_MS;
-  var e = S.est + d;
-  if (e < 0) e = 0;
-  if (e > 1) e = 1;
-  setEst(e);
-}
-
-// a run reached a terminal for certain (Auto-Off, S3 feedback)
-function atTerminal(dirId: Dir, why: string): void {
-  setEst(dirId === UP ? 1 : 0);
-  setPos(dirId === UP ? "top" : "bottom");
-  log("at " + (dirId === UP ? "top" : "bottom") + " (" + why + ")");
-}
-
-// after a stop: dead reckoning may still conclude we reached a floor
-function declareFromEst(): void {
-  if (S.est === null || S.pos !== "mid") return;
-  if (S.est >= 1 - CFG.EST_EDGE) atTerminal(UP, "dead reckoning");
-  else if (S.est <= CFG.EST_EDGE) atTerminal(DOWN, "dead reckoning");
-}
-
-function clearTimers(): void {
-  if (S.cdTimer !== null) {
-    Timer.clear(S.cdTimer);
-    S.cdTimer = null;
-  }
-}
-
-function fault(reason: string): void {
-  log("FAULT: " + reason + " — both outputs OFF, lockout (cmd=reset to clear)");
-  clearTimers();
-  bothOff();
-  S.state = "FAULT";
-  S.dir = null;
-  S.calib = false;
-  S.calibPending = false;
-}
-
-function cooldown(): void {
-  clearTimers();
-  S.state = "COOLDOWN";
-  S.dir = null;
-  S.cdTimer = Timer.set(
-    CFG.COOLDOWN_MS,
-    false,
-    guard("cdTimer", function () {
-      S.cdTimer = null;
-      S.state = "IDLE";
-      log("re-armed");
-      if (S.calibPending) {
-        if (inOn(UP) || inOn(DOWN)) {
-          cooldown(); // the calibration press is still held: wait it out
-          return;
+        fn(a, b, c, d);
+      } catch (e) {
+        try {
+          self.fault("exception in " + name + ": " + (e as Error).message);
+        } catch (e2) {
+          self.bothOff(); // last resort
         }
-        S.calibPending = false;
-        S.nextDir = null;
-        startCalibTrip();
-      } else if (S.nextDir !== null) {
-        var d = S.nextDir;
-        S.nextDir = null;
-        request(d, "reverse");
       }
-    }),
-  );
-}
-
-function stopTrip(reason: string): void {
-  log("STOP (" + reason + ")");
-  // only expect an off-event if something is actually on (a stop can race Auto-Off)
-  S.stopping = outOn(UP) || outOn(DOWN);
-  bothOff();
-  cooldown();
-}
-
-// full state reset (also clears FAULT/calibration); keeps position
-function hardReset(source: string): void {
-  log("HARD RESET (" + source + ")");
-  clearTimers();
-  bothOff();
-  S.state = "IDLE";
-  S.dir = null;
-  S.calib = false;
-  S.calibPending = false;
-  S.nextDir = null;
-  S.seqN = 0;
-  S.seqDir = null;
-  S.stopping = false;
-  S.onPending = null;
-  S.runOnTs = 0;
-}
-
-function armResetGesture(): void {
-  if (S.resetTimer !== null) return;
-  S.resetTimer = Timer.set(
-    CFG.RESET_HOLD_MS,
-    false,
-    guard("resetTimer", function () {
-      S.resetTimer = null;
-      if (inOn(UP) && inOn(DOWN)) hardReset("both buttons held");
-    }),
-  );
-}
-
-// Rocker paddle can't press both directions at once, so lockout states need a
-// one-button escape: hold EITHER paddle ≥ RESET_HOLD_MS during FAULT or a
-// calibration ride = hard reset. Never armed in normal states, so leaning on
-// the paddle during a run can't trigger it (runs are latched anyway).
-function armHoldEscape(dir: Dir): void {
-  if (S.holdTimer !== null) return;
-  S.holdTimer = Timer.set(
-    CFG.RESET_HOLD_MS,
-    false,
-    guard("holdTimer", function () {
-      S.holdTimer = null;
-      if (inOn(dir) && (S.state === "FAULT" || S.calib || S.calibPending))
-        hardReset("paddle held in lockout");
-    }),
-  );
-}
-
-// Calibration: full UP ride to the top limit; est becomes exactly 1 (100%).
-// Paddle inputs are IGNORED until Auto-Off completes it, then normal service
-// resumes at top/100%. Escapes: hold either paddle 3 s, ?cmd=stop, ?cmd=reset.
-function startCalibration(source: string): string {
-  log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
-  S.calib = true;
-  if (S.state === "RUNNING") {
-    if (S.dir === UP) return "calibrating"; // already riding up: this run is it
-    S.calibPending = true;
-    stopTrip("calibration: stop before UP ride");
-    return "calibrating";
-  }
-  if (S.state === "COOLDOWN") {
-    S.calibPending = true;
-    return "calibrating";
-  }
-  startCalibTrip();
-  return "calibrating";
-}
-
-function startCalibTrip(): void {
-  var r = request(UP, "calib");
-  if (r !== "accepted") {
-    S.calib = false;
-    S.calibPending = false;
-    log("calibration failed to start: " + r);
-  }
-}
-
-// ---------- state machine ----------
-
-// Single entry point for ALL request sources (physical inputs, HTTP/HomeKit).
-// Gestures (rev 9): single press = latched full run, energized immediately.
-// Opposite press during a run = REVERSE (stop, cooldown, run the other way).
-// Chained same-direction presses (within DBL_MS of the chain's first press):
-// 2nd = stop, 3rd = calibration.
-function request(dir: Dir, source: Source): string {
-  // reset gestures work from ANY state, including FAULT and calibration
-  if (source === "input") {
-    if (inOn(UP) && inOn(DOWN)) armResetGesture();
-    if (S.state === "FAULT" || S.calib || S.calibPending) armHoldEscape(dir);
+    };
   }
 
-  if (S.state === "FAULT") {
-    log("ignored " + DIR_NAME[dir] + " (" + source + "): FAULT lockout");
-    return "fault";
+  setOut(id: Dir, on: boolean): void {
+    this.cmd[id] = on;
+    if (!on) this.offTs[id] = Date.now();
+    this.io.pushRelay(id, on);
   }
 
-  // calibration ride: paddle inputs are ignored until Auto-Off completes it
-  if (S.calib && source === "input") {
-    log("ignored " + DIR_NAME[dir] + ": calibration in progress");
-    return "calibrating";
+  bothOff(): void {
+    this.setOut(UP, false);
+    this.setOut(DOWN, false);
   }
 
-  if (source === "input") {
-    if (S.seqDir === dir && Date.now() - S.seqStartTs <= CFG.DBL_MS) {
-      S.seqN++;
-    } else {
-      S.seqN = 1;
-      S.seqDir = dir;
-      S.seqStartTs = Date.now();
-    }
-    log("press " + DIR_NAME[dir] + " " + S.seqN + " (" + S.state + ")");
-    if (S.seqN === 3) {
-      S.seqN = 0;
-      S.seqDir = null;
-      return startCalibration(source);
-    }
+  outOn(id: Dir): boolean {
+    var st = Shelly.getComponentStatus("switch:" + id);
+    return st !== null && st.output === true;
   }
 
-  if (S.state === "RUNNING") {
-    if (dir !== S.dir) {
-      // opposite press = respected direction change (stop, dead-time, reverse)
-      S.nextDir = dir;
-      stopTrip("reverse to " + DIR_NAME[dir] + " (" + source + ")");
-      return "reversing";
-    }
-    if (source === "input" && S.seqN >= 2) {
-      stopTrip("double-press interrupt");
-      return "stopped";
-    }
-    if (source !== "input") return "already-running";
-    log("lone press during run ignored (press again within 3 s to stop)");
-    return "ignored";
+  inOn(id: Dir): boolean {
+    var st = Shelly.getComponentStatus("input:" + id);
+    return st !== null && st.state === true;
   }
 
-  if (S.state !== "IDLE") return "busy"; // COOLDOWN (chain still counted above)
-
-  if (rogueOn()) {
-    fault("output ON while believed IDLE");
-    return "fault";
-  }
-  if (outOn(UP) || outOn(DOWN)) {
-    log("outputs settling — press again");
-    return "settling";
-  }
-  if (inOn(dir === UP ? DOWN : UP)) {
-    log("opposite input held — refusing " + DIR_NAME[dir]);
-    cooldown();
-    return "conflict";
-  }
-
-  S.dir = dir;
-  return startTrip() ? "accepted" : "aborted";
-}
-
-function startTrip(): boolean {
-  if (outOn(UP) || outOn(DOWN)) {
-    if (rogueOn()) {
-      fault("output ON at trip start");
-    } else {
-      // our own OFF command hasn't landed yet (queue lag): abort quietly
-      log("outputs still settling — trip aborted, press again");
-      cooldown();
+  rogueOn(): boolean {
+    for (var i = UP; i <= DOWN; i++) {
+      var d = i as Dir;
+      if (this.outOn(d) && !this.cmd[d] && Date.now() - this.offTs[d] > CFG.OFF_GRACE_MS)
+        return true;
     }
     return false;
   }
-  // RUNNING before energizing: a chained press landing between decision and
-  // relay closure is handled as a run interrupt, never a second acceptance.
-  S.state = "RUNNING";
-  S.runOnTs = Date.now();
-  S.lastRunDir = S.dir;
-  S.onPending = S.dir; // expect our own ON echo (may arrive after a stop)
-  setPos("mid"); // persisted before energizing: power loss never restores a stale floor
-  setOut(S.dir as Dir, true);
-  log("RUNNING " + DIR_NAME[S.dir as Dir] + (S.calib ? " (calibration)" : ""));
-  return true;
-}
 
-function release(dir: Dir): void {
-  if (S.resetTimer !== null) {
-    Timer.clear(S.resetTimer);
-    S.resetTimer = null;
+  setPos(p: Pos): void {
+    if (this.pos === p) return;
+    this.pos = p;
+    this.log("position: " + p);
+    this.io.dirtyPos = true;
+    this.io.whQueue = [
+      CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (p === "top"),
+      CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (p === "bottom"),
+    ];
   }
-  if (S.holdTimer !== null) {
-    Timer.clear(S.holdTimer);
-    S.holdTimer = null;
-  }
-  // all runs are latched; releases carry no other meaning
-}
 
-Shelly.addEventHandler(
-  guard("eventHandler", function (ev: ShellyEvent) {
-    if (!ev.info || ev.info.event !== "toggle") return;
-    if (ev.component === "input:" + CFG.LIMIT_IN) {
-      if (S.limitFb && ev.info.state === true) limitHit();
+  setEst(e: number | null): void {
+    this.est = e;
+    this.io.dirtyEst = true;
+  }
+
+  updateEst(dirId: Dir, dtMs: number): void {
+    if (this.est === null || dtMs <= 0) return;
+    var d = dirId === UP ? dtMs / CFG.TRAVEL_UP_MS : -dtMs / CFG.TRAVEL_DOWN_MS;
+    var e = this.est + d;
+    if (e < 0) e = 0;
+    if (e > 1) e = 1;
+    this.setEst(e);
+  }
+
+  atTerminal(dirId: Dir, why: string): void {
+    this.setEst(dirId === UP ? 1 : 0);
+    this.setPos(dirId === UP ? "top" : "bottom");
+    this.log("at " + (dirId === UP ? "top" : "bottom") + " (" + why + ")");
+  }
+
+  declareFromEst(): void {
+    if (this.est === null || this.pos !== "mid") return;
+    if (this.est >= 1 - CFG.EST_EDGE) this.atTerminal(UP, "dead reckoning");
+    else if (this.est <= CFG.EST_EDGE) this.atTerminal(DOWN, "dead reckoning");
+  }
+
+  // ---- state transitions ----
+
+  clearTimers(): void {
+    if (this.cdTimer !== null) {
+      Timer.clear(this.cdTimer);
+      this.cdTimer = null;
+    }
+  }
+
+  fault(reason: string): void {
+    this.log("FAULT: " + reason + " — both outputs OFF, lockout (cmd=reset to clear)");
+    this.clearTimers();
+    this.bothOff();
+    this.state = "FAULT";
+    this.dir = null;
+    this.calib = false;
+    this.calibPending = false;
+    this.nextDir = null;
+  }
+
+  cooldown(): void {
+    this.clearTimers();
+    this.state = "COOLDOWN";
+    this.dir = null;
+    var self = this;
+    this.cdTimer = Timer.set(
+      CFG.COOLDOWN_MS,
+      false,
+      this.guard("cdTimer", function () {
+        self.cdTimer = null;
+        self.state = "IDLE";
+        self.log("re-armed");
+        if (self.calibPending) {
+          if (self.inOn(UP) || self.inOn(DOWN)) {
+            self.cooldown(); // the calibration press is still held: wait it out
+            return;
+          }
+          self.calibPending = false;
+          self.nextDir = null;
+          self.startCalibTrip();
+        } else if (self.nextDir !== null) {
+          var d = self.nextDir;
+          self.nextDir = null;
+          var r = self.request(d, "reverse");
+          if (r !== "accepted") self.log("reverse did not start: " + r);
+        }
+      }),
+    );
+  }
+
+  stopTrip(reason: string): void {
+    this.log("STOP (" + reason + ")");
+    this.stopping = this.outOn(UP) || this.outOn(DOWN);
+    this.bothOff();
+    this.cooldown();
+  }
+
+  hardReset(source: string): void {
+    this.log("HARD RESET (" + source + ")");
+    this.clearTimers();
+    this.bothOff();
+    this.state = "IDLE";
+    this.dir = null;
+    this.jog = false;
+    this.calib = false;
+    this.calibPending = false;
+    this.nextDir = null;
+    this.gestures.reset();
+    this.stopping = false;
+    this.onPending = null;
+    this.runOnTs = 0;
+  }
+
+  armResetGesture(): void {
+    if (this.resetTimer !== null) return;
+    var self = this;
+    this.resetTimer = Timer.set(
+      CFG.RESET_HOLD_MS,
+      false,
+      this.guard("resetTimer", function () {
+        self.resetTimer = null;
+        if (self.inOn(UP) && self.inOn(DOWN)) self.hardReset("both buttons held");
+      }),
+    );
+  }
+
+  // Rocker paddle can't press both directions; lockout states get a one-button
+  // escape. Never armed in normal states.
+  armHoldEscape(dir: Dir): void {
+    if (this.holdTimer !== null) return;
+    var self = this;
+    this.holdTimer = Timer.set(
+      CFG.RESET_HOLD_MS,
+      false,
+      this.guard("holdTimer", function () {
+        self.holdTimer = null;
+        if (self.inOn(dir) && (self.state === "FAULT" || self.calib || self.calibPending))
+          self.hardReset("paddle held in lockout");
+      }),
+    );
+  }
+
+  // ---- calibration ----
+
+  startCalibration(source: string): string {
+    this.log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
+    this.calib = true;
+    this.jog = false; // calibration always exits to normal mode
+    if (this.state === "RUNNING") {
+      if (this.dir === UP) return "calibrating"; // this run becomes the ride
+      this.calibPending = true;
+      this.stopTrip("calibration: stop before UP ride");
+      return "calibrating";
+    }
+    if (this.state === "COOLDOWN") {
+      this.calibPending = true;
+      return "calibrating";
+    }
+    this.startCalibTrip();
+    return "calibrating";
+  }
+
+  startCalibTrip(): void {
+    var r = this.request(UP, "calib");
+    if (r !== "accepted") {
+      this.calib = false;
+      this.calibPending = false;
+      this.log("calibration failed to start: " + r);
+    }
+  }
+
+  // ---- the single request entry point ----
+
+  request(dir: Dir, source: Source): string {
+    if (source === "input") {
+      if (this.inOn(UP) && this.inOn(DOWN)) this.armResetGesture();
+      if (this.state === "FAULT" || this.calib || this.calibPending) this.armHoldEscape(dir);
+    }
+
+    if (this.state === "FAULT") {
+      this.log("ignored " + DIR_NAME[dir] + " (" + source + "): FAULT lockout");
+      return "fault";
+    }
+
+    if (this.calib && source === "input") {
+      this.log("ignored " + DIR_NAME[dir] + ": calibration in progress");
+      return "calibrating";
+    }
+
+    if (source === "input") {
+      var g = this.gestures.classify(dir);
+      this.log("press " + DIR_NAME[dir] + " " + g.n + " (" + this.state + (this.jog ? ",jog" : "") + ")");
+      if (g.gesture === "calibrate") return this.startCalibration(source);
+      if (g.gesture === "jogToggle") return this.toggleJog(dir);
+      if (this.jog) return this.jogPress(dir); // hold-to-run handled on press/release
+    }
+
+    if (this.state === "RUNNING") {
+      if (dir !== this.dir) {
+        // opposite press = immediate stop, dead-time, full travel the other way
+        this.nextDir = dir;
+        this.stopTrip("reverse to " + DIR_NAME[dir] + " (" + source + ")");
+        return "reversing";
+      }
+      if (source !== "input") return "already-running";
+      this.log("same-direction press during run ignored");
+      return "ignored";
+    }
+
+    if (this.state !== "IDLE") return "busy"; // COOLDOWN (chain counted above)
+
+    if (this.rogueOn()) {
+      this.fault("output ON while believed IDLE");
+      return "fault";
+    }
+    if (this.outOn(UP) || this.outOn(DOWN)) {
+      this.log("outputs settling — press again");
+      return "settling";
+    }
+    if (this.inOn(dir === UP ? DOWN : UP)) {
+      this.log("opposite input held — refusing " + DIR_NAME[dir]);
+      this.cooldown();
+      return "conflict";
+    }
+
+    this.dir = dir;
+    return this.startRun(false) ? "accepted" : "aborted";
+  }
+
+  // same-direction double-press: enter/exit jog mode (entering stops any run)
+  toggleJog(dir: Dir): string {
+    this.jog = !this.jog;
+    this.log("jog mode " + (this.jog ? "ON (hold-to-run)" : "OFF"));
+    if (this.jog && this.state === "RUNNING") {
+      this.stopTrip("jog entry");
+    } else if (!this.jog && this.state === "RUNNING") {
+      this.stopTrip("jog exit"); // exiting mid-hold: stop; next press = travel
+    }
+    return this.jog ? "jog-on" : "jog-off";
+  }
+
+  // jog mode press: run unlatched while held (release stops it)
+  jogPress(dir: Dir): string {
+    if (this.state === "RUNNING") {
+      if (dir !== this.dir) {
+        this.nextDir = null; // no auto-reverse in jog: just stop
+        this.stopTrip("jog: opposite press");
+        return "stopped";
+      }
+      return "ignored";
+    }
+    if (this.state !== "IDLE") return "busy";
+    if (this.rogueOn()) {
+      this.fault("output ON while believed IDLE");
+      return "fault";
+    }
+    if (this.outOn(UP) || this.outOn(DOWN)) return "settling";
+    if (this.inOn(dir === UP ? DOWN : UP)) return "conflict";
+    this.dir = dir;
+    return this.startRun(true) ? "accepted" : "aborted";
+  }
+
+  // unlatched=true: jog hold-to-run (release stops); firmware Auto-Off still backs it up
+  startRun(unlatched: boolean): boolean {
+    if (this.outOn(UP) || this.outOn(DOWN)) {
+      if (this.rogueOn()) {
+        this.fault("output ON at trip start");
+      } else {
+        this.log("outputs still settling — run aborted, press again");
+        this.cooldown();
+      }
+      return false;
+    }
+    // RUNNING before energizing: a press landing between decision and relay
+    // closure is handled by the run rules, never as a second acceptance.
+    this.state = "RUNNING";
+    this.runOnTs = Date.now();
+    this.lastRunDir = this.dir;
+    this.onPending = this.dir;
+    this.setPos("mid"); // persisted before energizing
+    this.setOut(this.dir as Dir, true);
+    this.log(
+      "RUNNING " +
+        DIR_NAME[this.dir as Dir] +
+        (this.calib ? " (calibration)" : unlatched ? " (jog hold)" : ""),
+    );
+    return true;
+  }
+
+  release(dir: Dir): void {
+    if (this.resetTimer !== null) {
+      Timer.clear(this.resetTimer);
+      this.resetTimer = null;
+    }
+    if (this.holdTimer !== null) {
+      Timer.clear(this.holdTimer);
+      this.holdTimer = null;
+    }
+    // jog hold-to-run: release of the running direction stops the run
+    if (this.jog && !this.calib && this.state === "RUNNING" && dir === this.dir) {
+      this.stopTrip("jog release");
+    }
+  }
+
+  // ---- hardware feedback ----
+
+  limitHit(): void {
+    var d = this.state === "RUNNING" ? this.dir : this.lastRunDir;
+    if (d === null) {
+      this.log("limit feedback with no known direction — ignored");
       return;
     }
-    if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN)
-      return;
-    var id = ev.info.id as Dir;
-    if (ev.info.state === true) request(id, "input");
-    else release(id);
-  }),
-);
+    this.atTerminal(d, "S3 feedback");
+    if (this.calib) {
+      this.calib = false;
+      this.log("CALIBRATION complete — at top, 100%");
+    }
+    if (this.state === "RUNNING") {
+      this.stopping = this.outOn(UP) || this.outOn(DOWN);
+      this.bothOff();
+      this.cooldown();
+    }
+  }
 
-// S3: platform physically reached a terminal; direction of travel disambiguates
-function limitHit(): void {
-  var d = S.state === "RUNNING" ? S.dir : S.lastRunDir;
-  if (d === null) {
-    log("limit feedback with no known direction — ignored");
-    return;
-  }
-  atTerminal(d, "S3 feedback");
-  if (S.calib) {
-    S.calib = false;
-    log("CALIBRATION complete — at top, 100%");
-  }
-  if (S.state === "RUNNING") {
-    S.stopping = outOn(UP) || outOn(DOWN);
-    bothOff(); // end the command; motion already ended at the Harmar limit
-    cooldown();
-  }
-}
-
-Shelly.addStatusHandler(
-  guard("statusHandler", function (st: ShellyStatus) {
+  onSwitchStatus(st: ShellyStatus): void {
     if (st.name !== "switch" || (st.id !== UP && st.id !== DOWN)) return;
     if (!st.delta || st.delta.output === undefined) return;
     var id = st.id as Dir;
 
-    if (outOn(UP) && outOn(DOWN)) {
-      fault("both outputs ON");
+    if (this.outOn(UP) && this.outOn(DOWN)) {
+      this.fault("both outputs ON");
       return;
     }
 
     if (st.delta.output === false) {
-      // integrate actual energized time regardless of why it ended
-      if (S.runOnTs !== 0 && id === S.lastRunDir) {
-        updateEst(id, Date.now() - S.runOnTs);
-        S.runOnTs = 0;
+      if (this.runOnTs !== 0 && id === this.lastRunDir) {
+        this.updateEst(id, Date.now() - this.runOnTs);
+        this.runOnTs = 0;
       }
-      if (S.stopping) {
-        S.stopping = false;
-        declareFromEst(); // a stop may still have landed on a floor
+      if (this.stopping) {
+        this.stopping = false;
+        this.declareFromEst();
         return;
       }
-      if (S.state === "RUNNING" && id === S.dir) {
-        log("Auto-Off end of trip");
-        atTerminal(id, "Auto-Off");
-        if (S.calib) {
-          S.calib = false;
-          log("CALIBRATION complete — at top, 100%");
+      if (this.state === "RUNNING" && id === this.dir) {
+        this.log("Auto-Off end of run");
+        this.atTerminal(id, "Auto-Off");
+        if (this.calib) {
+          this.calib = false;
+          this.log("CALIBRATION complete — at top, 100%");
         }
-        cooldown();
+        this.cooldown();
       }
     } else {
-      if (id === S.onPending) {
-        // our own commanded-ON echo; if a stop already landed, the off-command
-        // is in flight and its off-event follows — not a fault
-        S.onPending = null;
+      if (id === this.onPending) {
+        this.onPending = null; // our own commanded-ON echo
         return;
       }
-      // stale ON event: we may have already commanded the output off
-      if (!outOn(id)) return;
-      if (S.state !== "RUNNING" || id !== S.dir) {
-        fault(
+      if (!this.outOn(id)) return; // stale
+      if (this.state !== "RUNNING" || id !== this.dir) {
+        this.fault(
           "unexpected output ON: switch:" +
             id +
             " source=" +
@@ -608,53 +652,142 @@ Shelly.addStatusHandler(
         );
       }
     }
+  }
+
+  // ---- init ----
+
+  init(): void {
+    this.io.attach(this);
+    this.bothOff(); // fail-safe regardless of pre-boot state
+    var self = this;
+
+    // est restore chained after pos restore: its fallback derives from pos
+    this.io.pushJob("KVS.Get", { key: CFG.POS_KEY }, function (r, ec) {
+      var rv = r as { value?: unknown } | null;
+      if (ec === 0 && rv && typeof rv.value === "string") self.pos = rv.value as Pos;
+      self.log("position restored: " + self.pos);
+      self.io.whQueue = [
+        CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (self.pos === "top"),
+        CFG.HB_WEBHOOK + "/?accessoryId=lift-bottom&state=" + (self.pos === "bottom"),
+      ];
+      self.io.pushJob("KVS.Get", { key: CFG.EST_KEY }, function (r2, ec2) {
+        var rv2 = r2 as { value?: unknown } | null;
+        if (ec2 === 0 && rv2 && rv2.value !== "" && typeof rv2.value === "string") {
+          var e = JSON.parse(rv2.value);
+          if (typeof e === "number") self.est = e;
+        }
+        if (self.est === null) {
+          if (self.pos === "top") self.est = 1;
+          else if (self.pos === "bottom") self.est = 0;
+        }
+        self.log("est restored: " + (self.est === null ? "null" : self.est));
+      });
+    });
+
+    var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
+    this.limitFb = lc !== null && lc.enable === true;
+    this.log(
+      "S3 limit feedback: " + (this.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"),
+    );
+
+    for (var i = UP; i <= DOWN; i++) {
+      var c = Shelly.getComponentConfig("switch:" + i);
+      if (c) {
+        if (c.auto_off && typeof c.auto_off_delay === "number") {
+          if (i === UP) CFG.TRAVEL_UP_MS = c.auto_off_delay * 1000;
+          else CFG.TRAVEL_DOWN_MS = c.auto_off_delay * 1000;
+        }
+        if (c.initial_state !== "off")
+          this.log("WARN switch:" + i + " initial_state='" + c.initial_state + "'");
+        if (c.in_mode !== "detached")
+          this.log("WARN switch:" + i + " in_mode='" + c.in_mode + "'");
+        if (!c.auto_off) this.log("WARN switch:" + i + " auto_off DISABLED");
+      }
+    }
+    this.log(
+      "armed — rev10 classes, cooldown " +
+        CFG.COOLDOWN_MS +
+        "ms, chain " +
+        CFG.DBL_MS +
+        "ms, travel " +
+        CFG.TRAVEL_UP_MS / 1000 +
+        "s/" +
+        CFG.TRAVEL_DOWN_MS / 1000 +
+        "s",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// wiring
+// ---------------------------------------------------------------------------
+
+var arbiter = new LiftArbiter();
+
+Shelly.addEventHandler(
+  arbiter.guard("eventHandler", function (ev: ShellyEvent) {
+    if (!ev.info || ev.info.event !== "toggle") return;
+    if (ev.component === "input:" + CFG.LIMIT_IN) {
+      if (arbiter.limitFb && ev.info.state === true) arbiter.limitHit();
+      return;
+    }
+    if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN) return;
+    var id = ev.info.id as Dir;
+    if (ev.info.state === true) arbiter.request(id, "input");
+    else arbiter.release(id);
   }),
 );
 
-// ---------- remote entry ----------
+Shelly.addStatusHandler(
+  arbiter.guard("statusHandler", function (st: ShellyStatus) {
+    arbiter.onSwitchStatus(st);
+  }),
+);
 
-// http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|calibrate|reset|hist | ?set=top|bottom|mid
+// http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|calibrate|reset|jog|hist | ?set=top|bottom|mid
 HTTPServer.registerEndpoint("lift", function (req, res) {
   var q = req.query ? req.query : "";
   var result = "status";
 
   try {
     if (q.indexOf("cmd=stop") !== -1) {
-      S.calib = false;
-      S.calibPending = false; // http stop is a calibration escape hatch
-      if (S.state === "RUNNING") {
-        stopTrip("http stop");
+      arbiter.calib = false;
+      arbiter.calibPending = false;
+      arbiter.nextDir = null;
+      if (arbiter.state === "RUNNING") {
+        arbiter.stopTrip("http stop");
         result = "stopped";
       } else {
         result = "not-running";
       }
     } else if (q.indexOf("cmd=calibrate") !== -1) {
-      result = S.calib ? "already-calibrating" : startCalibration("http");
+      result = arbiter.calib ? "already-calibrating" : arbiter.startCalibration("http");
     } else if (q.indexOf("cmd=reset") !== -1) {
-      hardReset("http");
+      arbiter.hardReset("http");
       result = "reset";
+    } else if (q.indexOf("cmd=jog") !== -1) {
+      result = arbiter.toggleJog(UP);
     } else if (q.indexOf("cmd=hist") !== -1) {
       result = "hist";
     } else if (q.indexOf("dir=up") !== -1) {
-      result = request(UP, "http");
+      result = arbiter.request(UP, "http");
     } else if (q.indexOf("dir=down") !== -1) {
-      result = request(DOWN, "http");
+      result = arbiter.request(DOWN, "http");
     } else if (q.indexOf("set=") !== -1) {
-      // manual position calibration, only while stationary
       var p: Pos | null = null;
       if (q.indexOf("set=top") !== -1) p = "top";
       else if (q.indexOf("set=bottom") !== -1) p = "bottom";
       else if (q.indexOf("set=mid") !== -1) p = "mid";
-      if (p !== null && S.state === "IDLE") {
-        setEst(p === "top" ? 1 : p === "bottom" ? 0 : null);
-        setPos(p);
+      if (p !== null && arbiter.state === "IDLE") {
+        arbiter.setEst(p === "top" ? 1 : p === "bottom" ? 0 : null);
+        arbiter.setPos(p);
         result = "calibrated";
       } else {
         result = "set-refused";
       }
     }
   } catch (e) {
-    fault("exception in http handler: " + (e as Error).message);
+    arbiter.fault("exception in http handler: " + (e as Error).message);
     result = "error";
   }
 
@@ -662,6 +795,7 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     result: string;
     state: MachineState;
     dir: string | null;
+    jog: boolean;
     calib: boolean;
     pos: Pos;
     pct: number | null;
@@ -669,97 +803,18 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     hist?: string[];
   } = {
     result: result,
-    state: S.state,
-    dir: S.dir === null ? null : DIR_NAME[S.dir],
-    calib: S.calib || S.calibPending,
-    pos: S.pos,
-    pct: S.est === null ? null : Math.round(S.est * 100),
-    est: S.est === null ? null : Math.round(S.est * 100) / 100,
+    state: arbiter.state,
+    dir: arbiter.dir === null ? null : DIR_NAME[arbiter.dir],
+    jog: arbiter.jog,
+    calib: arbiter.calib || arbiter.calibPending,
+    pos: arbiter.pos,
+    pct: arbiter.est === null ? null : Math.round(arbiter.est * 100),
+    est: arbiter.est === null ? null : Math.round(arbiter.est * 100) / 100,
   };
-  if (result === "hist") body.hist = S.hist;
+  if (result === "hist") body.hist = arbiter.hist;
   res.code = 200;
   res.body = JSON.stringify(body);
   res.send();
 });
 
-// ---------- init ----------
-
-function init(): void {
-  bothOff(); // fail-safe regardless of pre-boot state
-  S.state = "IDLE";
-  S.dir = null;
-  S.calib = false;
-  S.calibPending = false;
-  S.stopping = false;
-
-  // est restore chained after pos restore: its fallback derives from S.pos
-  IO.jobs.push({
-    kind: "job",
-    m: "KVS.Get",
-    p: { key: CFG.POS_KEY },
-    cb: function (r, ec) {
-      var rv = r as { value?: unknown } | null;
-      if (ec === 0 && rv && typeof rv.value === "string") S.pos = rv.value as Pos;
-      log("position restored: " + S.pos);
-      IO.whQueue = [
-        CFG.HB_WEBHOOK + "/?accessoryId=lift-top&state=" + (S.pos === "top"),
-        CFG.HB_WEBHOOK +
-          "/?accessoryId=lift-bottom&state=" +
-          (S.pos === "bottom"),
-      ];
-      IO.jobs.push({
-        kind: "job",
-        m: "KVS.Get",
-        p: { key: CFG.EST_KEY },
-        cb: function (r2, ec2) {
-          var rv2 = r2 as { value?: unknown } | null;
-          if (ec2 === 0 && rv2 && rv2.value !== "" && typeof rv2.value === "string") {
-            var e = JSON.parse(rv2.value);
-            if (typeof e === "number") S.est = e;
-          }
-          if (S.est === null) {
-            if (S.pos === "top") S.est = 1;
-            else if (S.pos === "bottom") S.est = 0;
-          }
-          log("est restored: " + (S.est === null ? "null" : S.est));
-        },
-      });
-    },
-  });
-
-  var lc = Shelly.getComponentConfig("input:" + CFG.LIMIT_IN);
-  S.limitFb = lc !== null && lc.enable === true;
-  log(
-    "S3 limit feedback: " +
-      (S.limitFb ? "ACTIVE" : "not wired (input:2 disabled)"),
-  );
-
-  for (var i = UP; i <= DOWN; i++) {
-    var c = Shelly.getComponentConfig("switch:" + i);
-    if (c) {
-      if (c.auto_off && typeof c.auto_off_delay === "number") {
-        // Auto-Off ≥ travel time, so it doubles as the full-travel scale
-        if (i === UP) CFG.TRAVEL_UP_MS = c.auto_off_delay * 1000;
-        else CFG.TRAVEL_DOWN_MS = c.auto_off_delay * 1000;
-      }
-      if (c.initial_state !== "off")
-        log("WARN switch:" + i + " initial_state='" + c.initial_state + "'");
-      if (c.in_mode !== "detached")
-        log("WARN switch:" + i + " in_mode='" + c.in_mode + "'");
-      if (!c.auto_off) log("WARN switch:" + i + " auto_off DISABLED");
-    }
-  }
-  log(
-    "armed — immediate latch, cooldown " +
-      CFG.COOLDOWN_MS +
-      "ms, chain " +
-      CFG.DBL_MS +
-      "ms, travel " +
-      CFG.TRAVEL_UP_MS / 1000 +
-      "s/" +
-      CFG.TRAVEL_DOWN_MS / 1000 +
-      "s (from auto_off_delay)",
-  );
-}
-
-init();
+arbiter.init();

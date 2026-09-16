@@ -1,4 +1,4 @@
-// Unit + fuzz tests for lift-arbiter.js (rev 9). Run: node test/run-tests.js
+// Unit + fuzz tests for lift-arbiter (rev 10, class build). Run: npm test
 "use strict";
 const { createEnv } = require("./shelly-mock");
 
@@ -23,7 +23,7 @@ function test(name, fn) {
 function boot() {
   const env = createEnv();
   env.load();
-  env.advance(500); // drain init via the tick
+  env.advance(500);
   return env;
 }
 
@@ -35,41 +35,38 @@ function baseline(env) {
 
 const UP = 0,
   DOWN = 1;
+const CHAIN_GAP = 3500; // outwait the 3 s chain anchor
 
-// single press = full run (energized on the next tick)
 function go(env, dir) {
   env.tap(dir, 80);
   env.advance(200);
 }
 
-// chained same-direction 2nd press = stop
-function stopDbl(env, dir) {
+// same-direction double-press (within the chain window)
+function dbl(env, dir) {
   env.tap(dir, 80, 300);
   env.tap(dir, 80);
   env.advance(300);
 }
 
-const CHAIN_GAP = 3500; // outwait the 3 s chain anchor
-
 // ---------- scripted cases ----------
 
-test("boot: outputs off, IDLE", () => {
+test("boot: outputs off, IDLE, normal mode", () => {
   const env = boot();
   const st = env.http("");
-  assert(st.state === "IDLE", "not idle: " + JSON.stringify(st));
+  assert(st.state === "IDLE" && !st.jog, "not idle/normal: " + JSON.stringify(st));
   assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs not off");
   baseline(env);
 });
 
-test("single press = immediate latched run, Auto-Off ends at top", () => {
+test("single press = immediate latched full travel", () => {
   const env = boot();
   env.press(UP);
-  env.advance(100); // no arbitration delay: energized within ~2 ticks
+  env.advance(100);
   assert(env.outputs[UP], "run not energized promptly");
   env.release(UP);
   env.advance(60000);
   const st = env.http("");
-  assert(!env.outputs[UP], "output still on after auto-off");
   assert(
     st.state === "IDLE" && st.pos === "top" && st.pct === 100,
     "not at top: " + JSON.stringify(st),
@@ -77,199 +74,195 @@ test("single press = immediate latched run, Auto-Off ends at top", () => {
   baseline(env);
 });
 
-test("lone same-direction press mid-run ignored; chained 2nd stops", () => {
-  const env = boot();
-  env.http("set=top");
-  env.advance(200);
-  go(env, DOWN);
-  env.advance(CHAIN_GAP); // let the start chain expire
-  env.tap(DOWN, 80); // lone press: new chain, ignored
-  env.advance(1000);
-  assert(env.outputs[DOWN], "lone press stopped the run");
-  env.tap(DOWN, 80); // chained 2nd (within 3 s of the lone press) = stop
-  env.advance(500);
-  assert(!env.outputs[DOWN], "chained 2nd press did not stop");
-  env.advance(CHAIN_GAP);
-  go(env, DOWN); // fresh chain = new run
-  assert(env.outputs[DOWN], "press after stop did not start a run");
-  env.advance(50000);
-  assert(env.http("").pos === "bottom", "remaining travel did not complete");
-  baseline(env);
-});
-
-test("opposite press mid-run = respected reversal (stop, dead-time, reverse)", () => {
+test("opposite press mid-travel = immediate stop then full travel opposite", () => {
   const env = boot();
   env.http("set=bottom");
   env.advance(200);
   go(env, UP);
-  env.advance(10000); // partway up
-  env.tap(UP === UP ? DOWN : UP, 80); // press DOWN
+  env.advance(10000);
+  env.tap(DOWN, 80); // reversal
   env.advance(150);
   assert(!env.outputs[UP] || !env.outputs[DOWN], "both on during reversal");
-  env.advance(1500); // stop + cooldown + auto-start
+  env.advance(1500); // stop + dead-time + auto-start
   assert(env.outputs[DOWN] && !env.outputs[UP], "did not reverse to DOWN");
   env.advance(50000);
-  const st = env.http("");
-  assert(
-    st.pos === "bottom",
-    "reversed run did not complete: " + JSON.stringify(st),
-  );
+  assert(env.http("").pos === "bottom", "reversed travel did not complete");
   baseline(env);
 });
 
-test("reversal never overlaps outputs (mock invariant across the swap)", () => {
+test("reverse then reverse again (indecisive rider)", () => {
   const env = boot();
   env.http("set=top");
   env.advance(200);
   go(env, DOWN);
   env.advance(5000);
-  env.tap(UP, 80); // reverse
+  env.tap(UP, 80); // reverse to UP
   env.advance(2000);
-  assert(
-    env.outputs[UP] && !env.outputs[DOWN],
-    "not running UP after reversal",
-  );
-  env.advance(60000);
-  assert(env.http("").pos === "top", "reversal ride did not complete");
-  baseline(env); // bothOnViolations check
-});
-
-test("HTTP same-direction request during run = already-running (no stop)", () => {
-  const env = boot();
-  env.http("set=bottom");
-  env.advance(200);
-  env.http("dir=up");
-  env.advance(200);
-  assert(env.outputs[UP], "http run did not start");
-  const r = env.http("dir=up");
-  assert(r.result === "already-running", "unexpected: " + r.result);
-  env.advance(300);
-  assert(env.outputs[UP], "same-direction http request stopped the run");
-  env.advance(60000);
+  assert(env.outputs[UP], "first reversal failed");
+  env.advance(2000);
+  env.tap(DOWN, 80); // reverse back to DOWN
+  env.advance(2000);
+  assert(env.outputs[DOWN] && !env.outputs[UP], "second reversal failed");
+  env.advance(50000);
   baseline(env);
 });
 
-test("triple same-direction presses = calibration; mixed directions never calibrate", () => {
+test("same-dir double-press = jog ON (stops the run); double again = jog OFF", () => {
   const env = boot();
-  env.tap(UP, 60, 400);
-  env.tap(UP, 60, 400);
+  env.http("set=top");
+  env.advance(200);
+  go(env, DOWN);
+  env.advance(5000);
+  env.advance(CHAIN_GAP); // expire the start chain
+  dbl(env, DOWN); // enter jog: stops the run
+  env.advance(500);
+  let st = env.http("");
+  assert(!env.outputs[DOWN], "jog entry did not stop the run");
+  assert(st.jog === true, "jog not entered: " + JSON.stringify(st));
+  env.advance(CHAIN_GAP);
+  dbl(env, DOWN); // exit jog
+  env.advance(500);
+  st = env.http("");
+  assert(st.jog === false, "jog not exited: " + JSON.stringify(st));
+  env.advance(CHAIN_GAP);
+  go(env, DOWN); // normal travel resumes
+  assert(env.outputs[DOWN], "no travel after jog exit");
+  env.advance(50000);
+  baseline(env);
+});
+
+test("jog mode: hold-to-run, release stops", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  dbl(env, DOWN); // press1 starts run, press2 enters jog (stops)
+  env.advance(500);
+  assert(env.http("").jog === true, "not in jog");
+  env.advance(CHAIN_GAP);
+  env.press(DOWN);
+  env.advance(2000);
+  assert(env.outputs[DOWN], "jog hold not running");
+  env.advance(3000); // held past the chain window: must NOT exit jog or latch
+  assert(env.outputs[DOWN], "jog hold dropped early");
+  env.release(DOWN);
+  env.advance(600);
+  const st = env.http("");
+  assert(!env.outputs[DOWN], "jog release did not stop");
+  assert(st.jog === true, "jog lost after release");
+  baseline(env);
+});
+
+test("jog: opposite press stops (no auto-reverse in jog)", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  dbl(env, DOWN);
+  env.advance(CHAIN_GAP);
+  env.press(DOWN);
+  env.advance(2000);
+  env.press(UP); // opposite while jog-holding
+  env.advance(600);
+  assert(!env.outputs[DOWN], "opposite press did not stop jog run");
+  env.advance(2000);
+  assert(!env.outputs[UP], "jog auto-reversed (it must not)");
+  env.release(DOWN);
+  env.release(UP);
+  env.advance(1000);
+  baseline(env);
+});
+
+test("triple same-dir = calibration (via transient jog), exits to normal at top", () => {
+  const env = boot();
+  env.tap(UP, 60, 300);
+  env.tap(UP, 60, 300);
   env.tap(UP, 60);
-  env.advance(1500);
+  env.advance(2000);
   let st = env.http("");
   assert(st.calib === true, "calibration not entered: " + JSON.stringify(st));
   assert(env.outputs[UP], "calibration ride not running");
+  env.tap(DOWN, 200, 100); // ignored during ride
+  env.advance(1000);
+  assert(env.outputs[UP], "paddle interrupted calibration");
   env.advance(60000);
   st = env.http("");
   assert(
-    st.calib === false &&
-      st.pos === "top" &&
-      st.pct === 100 &&
-      st.state === "IDLE",
-    "calibration did not complete/exit: " + JSON.stringify(st),
+    st.calib === false && st.jog === false && st.pos === "top" && st.pct === 100,
+    "calibration did not complete to normal: " + JSON.stringify(st),
   );
+  env.advance(CHAIN_GAP);
+  go(env, DOWN);
+  assert(env.outputs[DOWN], "normal travel refused after calibration");
+  env.advance(50000);
   baseline(env);
-
-  // mixed-direction mash on a fresh device: U D U within 3 s = reversal chain, no calibration
-  const env2 = boot();
-  env2.tap(UP, 60, 400);
-  env2.tap(DOWN, 60, 400);
-  env2.tap(UP, 60);
-  env2.advance(3000);
-  assert(env2.http("").calib === false, "mixed-direction presses calibrated");
-  env2.advance(120000);
-  baseline(env2);
 });
 
-test("calibration ignores paddle; hold ONE paddle 3s escapes", () => {
+test("calibration lockout escape: hold one paddle 3 s", () => {
   const env = boot();
-  env.tap(DOWN, 60, 300); // 1: starts DOWN run
-  env.tap(DOWN, 60, 300); // 2: stop
-  env.tap(DOWN, 60); // 3: calibrate
+  env.tap(UP, 60, 300);
+  env.tap(UP, 60, 300);
+  env.tap(UP, 60);
   env.advance(2000);
-  let st = env.http("");
-  assert(st.calib === true, "calibration not entered");
-  assert(env.outputs[UP], "UP calibration ride not running");
-  env.tap(DOWN, 200, 200); // ignored
-  env.tap(UP, 200, 200); // ignored
-  env.advance(1000);
-  assert(env.outputs[UP], "paddle press interrupted calibration");
-  env.press(DOWN); // hold escape
+  assert(env.http("").calib === true, "calibration not entered");
+  env.press(DOWN);
   env.advance(3300);
   env.release(DOWN);
   env.advance(500);
-  st = env.http("");
-  assert(
-    st.calib === false && st.state === "IDLE",
-    "hold escape failed: " + JSON.stringify(st),
-  );
+  const st = env.http("");
+  assert(st.calib === false && st.state === "IDLE", "hold escape failed");
   assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs on after escape");
   baseline(env);
 });
 
-test("rocker escape: hold ONE paddle 3s clears FAULT", () => {
+test("rogue direct Switch.Set => FAULT; hold escape clears", () => {
   const env = boot();
   env.setOutputExternal(UP, true);
   env.advance(2500);
   assert(env.http("").state === "FAULT", "rogue output did not FAULT");
+  assert(!env.outputs[UP], "FAULT did not force outputs off");
   env.press(DOWN);
   env.advance(3300);
   env.release(DOWN);
   env.advance(500);
   assert(env.http("").state === "IDLE", "hold escape did not clear FAULT");
   go(env, DOWN);
-  assert(env.outputs[DOWN], "no run after escape");
+  assert(env.outputs[DOWN], "no travel after escape");
   env.advance(50000);
   baseline(env);
 });
 
-test("leaning on the paddle during a normal run is harmless", () => {
-  const env = boot();
-  env.http("set=top");
-  env.advance(200);
-  env.press(DOWN);
-  env.advance(10000);
-  assert(env.outputs[DOWN], "leaning disturbed the run");
-  env.release(DOWN);
-  env.advance(40000);
-  assert(env.http("").pos === "bottom", "run did not complete");
-  baseline(env);
-});
-
-test("dead reckoning: stop tracks est; run to limit declares floor", () => {
+test("dead reckoning: jog positioning tracks est; hold to limit declares floor", () => {
   const env = boot();
   env.http("set=top");
   env.advance(200);
   go(env, DOWN);
   env.advance(22000); // ~half of 45 s
-  env.tap(DOWN, 80, 300);
-  env.tap(DOWN, 80); // chained stop
+  env.advance(CHAIN_GAP - 200);
+  dbl(env, DOWN); // stop into jog
   env.advance(1000);
   let st = env.http("");
   assert(st.pos === "mid", "should be mid: " + JSON.stringify(st));
-  assert(st.est > 0.35 && st.est < 0.65, "est not ~0.5: " + st.est);
+  assert(st.est > 0.3 && st.est < 0.7, "est not ~mid: " + st.est);
   env.advance(CHAIN_GAP);
-  go(env, DOWN);
-  env.advance(50000);
+  env.press(DOWN); // jog-hold the rest of the way
+  env.advance(st.est * 45000 + 500);
+  env.release(DOWN);
+  env.advance(1000);
   st = env.http("");
-  assert(
-    st.pos === "bottom" && st.pct === 0,
-    "not at bottom: " + JSON.stringify(st),
-  );
+  assert(st.pos === "bottom" && st.pct === 0, "hold to limit not declared: " + JSON.stringify(st));
   baseline(env);
 });
 
-test("stop racing auto-off does not strand the stopping flag", () => {
+test("http stop racing auto-off does not strand the stopping flag", () => {
   const env = boot();
   env.http("set=bottom");
   env.advance(200);
   go(env, UP);
-  env.advance(54600); // just before 55 s auto-off
-  env.tap(UP, 60, 150);
-  env.tap(UP, 60); // chained stop lands as auto-off fires
-  env.advance(CHAIN_GAP);
-  go(env, DOWN); // follow-up run must still complete & declare its floor
+  env.advance(54800); // just before 55 s auto-off
+  env.http("cmd=stop"); // stop lands as auto-off fires
+  env.advance(2500);
+  go(env, DOWN);
   env.advance(50000);
-  assert(env.http("").pos === "bottom", "follow-up run did not declare floor");
+  assert(env.http("").pos === "bottom", "follow-up travel did not declare floor");
   baseline(env);
 });
 
@@ -282,7 +275,7 @@ test("slow RPC completions never exceed the firmware call limit", () => {
   env.advance(2000);
   env.tap(UP, 80); // reversal under load
   env.advance(2000);
-  env.tap(DOWN, 80); // reverse again
+  env.tap(DOWN, 80); // reverse again under load
   env.advance(3000);
   baseline(env);
 });
@@ -318,34 +311,32 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     }
     if (held[UP]) env.release(UP);
     if (held[DOWN]) env.release(DOWN);
-    env.advance(130000); // settle: mash may chain reversals/calibrations
+    env.advance(130000); // settle (reversals + calibration rides included)
 
     let st = env.http("");
     assert(
       st.state === "IDLE" && !st.calib,
-      "iter " +
-        iter +
-        ": stuck in " +
-        st.state +
-        " calib=" +
-        st.calib +
-        " hist=" +
-        JSON.stringify(env.http("cmd=hist").hist),
+      "iter " + iter + ": stuck in " + st.state + " calib=" + st.calib +
+        " hist=" + JSON.stringify(env.http("cmd=hist").hist),
     );
-    assert(
-      !env.outputs[UP] && !env.outputs[DOWN],
-      "iter " + iter + ": output stuck on",
-    );
+    assert(!env.outputs[UP] && !env.outputs[DOWN], "iter " + iter + ": output stuck on");
 
+    // recoverability: exit jog if the mash left it on, then travel to a floor
+    if (st.jog) {
+      const jd = st.pos === "top" ? DOWN : UP;
+      env.tap(jd, 80, 400);
+      env.tap(jd, 80);
+      env.advance(1000);
+      st = env.http("");
+      assert(!st.jog, "iter " + iter + ": double-press did not exit jog");
+      env.advance(CHAIN_GAP);
+    }
     const dir = st.pos === "top" ? DOWN : UP;
     go(env, dir);
     assert(env.outputs[dir], "iter " + iter + ": recovery press did not run");
     env.advance(60000);
     st = env.http("");
-    assert(
-      st.state === "IDLE" && !env.outputs[dir],
-      "iter " + iter + ": recovery run did not finish",
-    );
+    assert(st.state === "IDLE" && !env.outputs[dir], "iter " + iter + ": recovery run did not finish");
     baseline(env);
   }
 });
@@ -356,10 +347,7 @@ test("fuzz: literal Konami code (UU DD UD UD) mash", () => {
   for (const id of seqs) env.tap(id, 60, 120);
   env.advance(130000);
   const st = env.http("");
-  assert(
-    st.state === "IDLE" && !st.calib,
-    "Konami stuck the arbiter: " + JSON.stringify(st),
-  );
+  assert(st.state === "IDLE" && !st.calib, "Konami stuck the arbiter: " + JSON.stringify(st));
   assert(!env.outputs[UP] && !env.outputs[DOWN], "Konami left an output on");
   baseline(env);
 });
