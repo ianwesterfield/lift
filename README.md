@@ -34,7 +34,7 @@ O3/S3 unused/reserved
 
 Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip, the active output still turns off at 55/45 s. The script must never re-issue `Switch.Set on` to extend a trip.
 
-## Behavior specification (rev 12)
+## Behavior specification (rev 13)
 
 States: `IDLE → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. Gestures are classified by **press count within 3 s of the chain's first press, direction-agnostic** — only the number of presses matters, not which paddle. (The 3 s window absorbs real-world input latency: a press travels Phoenix relay → 120 VAC → Shelly AC input detection before the script sees it.)
 
@@ -43,7 +43,7 @@ States: `IDLE → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. Gestures are cla
 | **Single press** (idle)                              | Latched full run that direction, energized immediately                                                                                     |
 | **Opposite press during a run**                      | **REVERSE**: immediate stop, dead-time, then automatic full run the other way                                                              |
 | Same-direction press during a run                    | Counts toward the chain, otherwise ignored                                                                                                 |
-| **2nd press** (any direction, ≤ 3 s chain)           | **Toggle JOG MODE** (entering jog stops the run)                                                                                           |
+| **2nd press** (any direction, ≤ 3 s chain)           | **Toggle JOG MODE** (entering stops the run, cancels any pending reverse, and fires a **0.4 s confirmation burst** in the pressed direction)  |
 | **3rd press** (any direction)                        | **Calibration**: full-UP ride, paddle IGNORED until Auto-Off → top / 100%, exits to normal mode                                            |
 | Jog mode press                                       | **Hold-to-run**: release stops; opposite press stops (no auto-reverse); double-press exits jog                                             |
 | Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                                                                             |
@@ -69,7 +69,7 @@ mJS has a tiny call stack, fw 2.0.0 clobbers params of `Shelly.call`s dispatched
 4. COOLDOWN → IDLE is promoted by the IO tick only when the dead-time (currently 0 ms) has passed AND the relay queue is empty AND both outputs are physically OFF — "zero cooldown" really means "as soon as the hardware confirms quiescent".
 5. Boot: both outputs forced OFF, state IDLE.
 6. Trip refused if the opposite input is currently held (stuck button / welded Phoenix contact); a failed reverse auto-start is logged, never silent.
-7. Command-intent tracking (`commandedOn[]` + 2 s OFF grace): queue lag never false-FAULTs, but a genuinely rogue output (welded relay, unexplained source) forces both OFF and enters **FAULT lockout** (cleared only by `cmd=reset`, the paddle-hold escapes, or script restart). A *deliberate* external ON (UI/RPC source) from IDLE/COOLDOWN is instead adopted as a governed run.
+7. Command-intent tracking (`commandedOn[]` + 2 s OFF grace): queue lag never false-FAULTs, but a genuinely rogue output (welded relay, unexplained source) forces both OFF and enters **FAULT lockout** (cleared only by `cmd=reset`, the paddle-hold escapes, or script restart). A _deliberate_ external ON (UI/RPC source) from IDLE/COOLDOWN is instead adopted as a governed run.
 
 ### Race handling
 
@@ -130,7 +130,7 @@ For Siri phrasing, wrap the pushbuttons in Home-app scenes ("Lift up" / "Lift do
 
 ## Watchdog
 
-[src/watchdog.ts](src/watchdog.ts) → script slot 2 (`lift-watchdog`, run-on-startup): checks script 1 every 10 s and restarts it if halted — with detached inputs a crashed arbiter means dead paddles. A revival also raises the Lift Fault sensor; the arbiter's healthy boot clears it. The 3 s paddle hold clears FSM lockouts but cannot revive a crashed *script*; the watchdog closes that gap.
+[src/watchdog.ts](src/watchdog.ts) → script slot 2 (`lift-watchdog`, run-on-startup): checks script 1 every 10 s and restarts it if halted — with detached inputs a crashed arbiter means dead paddles. A revival also raises the Lift Fault sensor; the arbiter's healthy boot clears it. The 3 s paddle hold clears FSM lockouts but cannot revive a crashed _script_; the watchdog closes that gap.
 
 ## Deploy
 
@@ -142,10 +142,10 @@ Automated coverage lives in [test/run-tests.js](test/run-tests.js) (25 tests inc
 
 1. Single press UP, single press DOWN → latched trip each; Auto-Off ends the command and declares the floor.
 2. Opposite press mid-run → stop, then automatic full run the other way.
-3. Double-press → jog mode ON (run stops); hold-to-run works, release stops; double-press again → normal mode.
+3. Double-press → jog mode ON (run stops, then a short confirmation nudge in the pressed direction); hold-to-run works, release stops; double-press again → normal mode. **Wait 3 s after the double-press before jogging — a 3rd press inside the chain window is the calibration gesture.**
 4. Triple-press (mix directions) → calibration ride UP, paddle dead until the top; exits to normal.
 5. Stuck input: hold one button, press the other from IDLE → refused (`conflict` in hist).
-6. FAULT: toggle an output from the management UI while a run is active in the *opposite* direction → both OFF, lockout; hold either paddle 3 s clears. A UI toggle while idle should be **adopted**, not fault.
+6. FAULT: toggle an output from the management UI while a run is active in the _opposite_ direction → both OFF, lockout; hold either paddle 3 s clears. A UI toggle while idle should be **adopted**, not fault.
 7. Reboot mid-trip → both outputs OFF at boot, state IDLE, position/est restored from KVS.
 8. Stop the script mid-trip → firmware Auto-Off still ends the trip; watchdog restarts the script ≤ 12 s (Lift Fault sensor blips).
 9. Throughout: confirm O1 and O2 are never ON together (watch both channel LEDs / status).

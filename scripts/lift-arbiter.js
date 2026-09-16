@@ -10,11 +10,13 @@
 // O1 (switch:0) = J6 UP, O2 (switch:1) = J6 DOWN.
 // S1 (input:0)  = any physical UP request, S2 (input:1) = any physical DOWN.
 //
-// GESTURES (rev 12) — press count within 3 s of the chain's first press,
+// GESTURES (rev 13) — press count within 3 s of the chain's first press,
 // direction-agnostic:
 //   idle press            -> latched full travel (energized immediately)
 //   opposite press in run -> REVERSE: stop, dead-time, full travel other way
-//   2nd press             -> toggle JOG MODE (stops the run on entry)
+//   2nd press             -> toggle JOG MODE (stops the run on entry; entering
+//                            fires a short confirmation burst in the pressed
+//                            direction and cancels any pending reverse)
 //   3rd press             -> CALIBRATION ride (full UP, paddle locked)
 //   jog mode              -> hold-to-run; double-press exits back to normal
 //   hold paddle 3 s       -> lockout escape (FAULT/calibration only)
@@ -37,6 +39,7 @@ var CFG = {
     ESTIMATE_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
     OFF_GRACE_MS: 2000, // commanded-OFF may lag this long before it's "rogue"
     RESET_HOLD_MS: 3000, // lockout-escape hold duration
+    JOG_BURST_MS: 400, // jog-entry confirmation nudge duration
     LIMIT_INPUT: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
     POSITION_KEY: "lift.pos",
     ESTIMATE_KEY: "lift.est",
@@ -229,6 +232,8 @@ var LiftArbiter = /** @class */ (function () {
         this.calibrating = false; // calibration ride: paddle ignored until Auto-Off
         this.calibrationPending = false;
         this.reverseTo = null; // reversal target after cooldown
+        this.burstTo = null; // jog-entry confirmation nudge, fired by pump
+        this.bursting = false; // burst is script-owned: paddle release must not stop it
         this.runStartedAt = 0;
         this.lastRunDirection = null;
         this.expectedOnEcho = null; // commanded-ON echo still in flight
@@ -354,6 +359,8 @@ var LiftArbiter = /** @class */ (function () {
         this.calibrating = false;
         this.calibrationPending = false;
         this.reverseTo = null;
+        this.burstTo = null;
+        this.bursting = false;
         this.runStartedAt = 0; // hygiene: no stale segment survives a fault
         this.pushFaultAlert(true); // HomeKit-visible alarm
     };
@@ -363,6 +370,7 @@ var LiftArbiter = /** @class */ (function () {
     LiftArbiter.prototype.cooldown = function () {
         this.state = "COOLDOWN" /* MachineState.Cooldown */;
         this.direction = null;
+        this.bursting = false;
         this.cooldownUntil = Date.now() + CFG.COOLDOWN_MS;
     };
     // called every IO tick: re-arm and run any pending auto-start intents
@@ -393,6 +401,29 @@ var LiftArbiter = /** @class */ (function () {
             if (outcome !== "accepted")
                 this.log("reverse did not start: " + outcome);
         }
+        else if (this.jogMode && this.burstTo !== null) {
+            this.startJogBurst();
+        }
+    };
+    // brief nudge in the double-pressed direction: tactile "you are in jog now"
+    LiftArbiter.prototype.startJogBurst = function () {
+        var _this = this;
+        var burstDirection = this.burstTo;
+        this.burstTo = null;
+        var outcome = this.jogPress(burstDirection);
+        if (outcome !== "accepted") {
+            this.log("jog burst skipped: " + outcome);
+            return;
+        }
+        this.bursting = true; // the second tap's release event may still be inbound
+        this.log("jog confirm burst " + DIRECTION_NAME[burstDirection]);
+        Timer.set(CFG.JOG_BURST_MS, false, this.guard("jogBurstTimer", function () {
+            if (_this.state === "RUNNING" /* MachineState.Running */ &&
+                _this.direction === burstDirection &&
+                _this.jogMode) {
+                _this.stopRun("jog burst done");
+            }
+        }));
     };
     LiftArbiter.prototype.stopRun = function (reason) {
         this.log("STOP (" + reason + ")");
@@ -411,6 +442,8 @@ var LiftArbiter = /** @class */ (function () {
         this.calibrating = false;
         this.calibrationPending = false;
         this.reverseTo = null;
+        this.burstTo = null;
+        this.bursting = false;
         this.gestures.reset();
         this.expectingOffEcho = false;
         this.expectedOnEcho = null;
@@ -447,6 +480,7 @@ var LiftArbiter = /** @class */ (function () {
         this.log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
         this.calibrating = true;
         this.jogMode = false; // calibration always exits to normal mode
+        this.burstTo = null;
         if (this.state === "RUNNING" /* MachineState.Running */) {
             if (this.direction === 0 /* Direction.Up */)
                 return "calibrating"; // this run becomes the ride
@@ -499,7 +533,7 @@ var LiftArbiter = /** @class */ (function () {
             if (classified.gesture === "calibrate" /* GestureKind.Calibrate */)
                 return this.startCalibration(source);
             if (classified.gesture === "jogToggle" /* GestureKind.JogToggle */)
-                return this.toggleJogMode();
+                return this.toggleJogMode(direction);
             if (this.jogMode)
                 return this.jogPress(direction);
         }
@@ -533,12 +567,24 @@ var LiftArbiter = /** @class */ (function () {
         this.direction = direction;
         return this.startRun(false) ? "accepted" : "aborted";
     };
-    // double-press: enter/exit jog mode (entering stops any run)
-    LiftArbiter.prototype.toggleJogMode = function () {
+    // double-press: enter/exit jog mode (entering stops any run and cancels any
+    // pending reverse — jog means "manual control now"). Entering queues a short
+    // confirmation burst in the pressed direction so the rider gets feedback.
+    LiftArbiter.prototype.toggleJogMode = function (direction) {
         this.jogMode = !this.jogMode;
         this.log("jog mode " + (this.jogMode ? "ON (hold-to-run)" : "OFF"));
+        if (this.jogMode) {
+            this.reverseTo = null;
+            this.burstTo = direction;
+        }
+        else {
+            this.burstTo = null;
+        }
         if (this.state === "RUNNING" /* MachineState.Running */) {
             this.stopRun(this.jogMode ? "jog entry" : "jog exit");
+        }
+        else if (this.jogMode && this.state === "IDLE" /* MachineState.Idle */ && direction !== null) {
+            this.cooldown(); // route the burst through the pump's quiescence checks
         }
         return this.jogMode ? "jog-on" : "jog-off";
     };
@@ -601,8 +647,10 @@ var LiftArbiter = /** @class */ (function () {
             this.holdEscapeTimer = null;
         }
         // jog hold-to-run: release of the running direction stops the run
+        // (except the confirmation burst, which is script-owned)
         if (this.jogMode &&
             !this.calibrating &&
+            !this.bursting &&
             this.state === "RUNNING" /* MachineState.Running */ &&
             direction === this.direction) {
             this.stopRun("jog release");
@@ -781,7 +829,7 @@ var LiftArbiter = /** @class */ (function () {
             if (!switchConfig.auto_off)
                 this.log("WARN switch:" + id + " auto_off DISABLED");
         }
-        this.log("armed — rev12 adoption+enums, cooldown " +
+        this.log("armed — rev13 jog-burst, cooldown " +
             CFG.COOLDOWN_MS +
             "ms (tick-confirmed), chain " +
             CFG.CHAIN_MS +
@@ -843,7 +891,7 @@ HTTPServer.registerEndpoint("lift", function (request, response) {
             result = "reset";
         }
         else if (query.indexOf("cmd=jog") !== -1) {
-            result = arbiter.toggleJogMode();
+            result = arbiter.toggleJogMode(null); // no direction: no confirmation burst
         }
         else if (query.indexOf("cmd=hist") !== -1) {
             result = "hist";

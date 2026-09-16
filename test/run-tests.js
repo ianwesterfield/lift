@@ -117,8 +117,8 @@ test("same-dir double-press = jog ON (stops the run); double again = jog OFF", (
   go(env, DOWN);
   env.advance(5000);
   env.advance(CHAIN_GAP); // expire the start chain
-  dbl(env, DOWN); // enter jog: stops the run
-  env.advance(500);
+  dbl(env, DOWN); // enter jog: stops the run (confirmation burst follows)
+  env.advance(2000); // let the burst finish
   let st = env.http("");
   assert(!env.outputs[DOWN], "jog entry did not stop the run");
   assert(st.jog === true, "jog not entered: " + JSON.stringify(st));
@@ -192,6 +192,52 @@ test("quick opposite press within the chain window = jog toggle, NOT reverse", (
     st.jog === true,
     "quick opposite did not toggle jog: " + JSON.stringify(st),
   );
+  baseline(env);
+});
+
+test("jog entry fires a confirmation burst in the pressed direction", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  dbl(env, DOWN); // from idle: press1 runs, press2 = jog ON (run stops)
+  let sawBurst = false;
+  for (let i = 0; i < 60; i++) {
+    env.advance(25);
+    if (env.outputs[DOWN]) sawBurst = true;
+  }
+  assert(sawBurst, "no confirmation burst after jog entry");
+  env.advance(2000);
+  assert(!env.outputs[DOWN] && !env.outputs[UP], "burst did not self-stop");
+  const st = env.http("");
+  assert(
+    st.jog === true && st.state === "IDLE",
+    "not idle-in-jog after burst: " + JSON.stringify(st),
+  );
+  const hist = env.http("cmd=hist").hist.join(" | ");
+  assert(
+    hist.indexOf("jog confirm burst DOWN") !== -1,
+    "burst not logged: " + hist,
+  );
+  baseline(env);
+});
+
+test("jog entry cancels a pending reverse (no latched surprise run)", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  go(env, DOWN);
+  env.advance(CHAIN_GAP); // expire the start chain
+  env.tap(UP, 80, 200); // reverse intent: stop + pending UP
+  env.tap(UP, 80); // 2nd press of the new chain: jog ON, reverse cancelled
+  env.advance(300);
+  assert(env.http("").jog === true, "jog not entered");
+  env.advance(5000); // burst window plus the would-be reverse launch
+  const st = env.http("");
+  assert(
+    st.state === "IDLE",
+    "run latched after jog entry: " + JSON.stringify(st),
+  );
+  assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs on after jog entry");
   baseline(env);
 });
 
