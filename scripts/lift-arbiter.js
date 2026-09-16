@@ -11,7 +11,7 @@ var CFG = {
   ARB_MS: 75, // arbitration window before energizing
   COOLDOWN_MS: 400, // dead-time after any stop before re-arm
   TAP_MS: 400, // press shorter than this = tap (arms the double-press)
-  DBL_MS: 1000, // gesture window: 2nd press within 1 s of the previous
+  DBL_MS: 500, // gesture window: chained presses must land within 0.5 s
   TRAVEL_UP_MS: 55000, // dead-reckoning scale; overwritten at init from auto_off_delay
   TRAVEL_DOWN_MS: 45000,
   EST_EDGE: 0.03, // estimate within this of 0/1 counts as at that floor
@@ -30,11 +30,15 @@ var DIR_NAME = ["UP", "DOWN"];
 var S = {
   state: "IDLE", // IDLE | PENDING | RUNNING | COOLDOWN | FAULT
   dir: null,
-  jog: false, // retained for status compat; always false in the modeless rev
+  calib: false, // calibration ride: full UP, paddle inputs ignored until Auto-Off
+  calibPending: false, // start the calibration UP trip when cooldown re-arms
   latched: false, // RUNNING: true = latched trip, false = hold-to-run
   forceLatch: false, // double-press detected at request time: latch this trip
   lastTapDir: null, // last quick tap / stop press: arms the double-press
   lastTapTs: 0,
+  seqN: 0, // rapid same-direction press chain (3 = calibration)
+  seqDir: null,
+  seqTs: 0,
   pressTs: 0,
   runOnTs: 0, // when the output actually energized (dead reckoning)
   lastRunDir: null,
@@ -88,43 +92,95 @@ function inOn(id) {
 }
 
 function setOut(id, on) {
-  Shelly.call("Switch.Set", { id: id, on: on });
+  rpcUrgent("Switch.Set", { id: id, on: on }, "switch");
 }
 
-// Firmware allows ~5 concurrent outbound calls. Switch.Set stays direct (≤2
-// at once, never delayed); ALL other RPC goes through 2 queue slots => ≤4
-// concurrent total. Blackbox log writes coalesce to at most one queued job.
-var Q = { inflight: 0, jobs: [] };
+// One budget for ALL script RPC (firmware caps ~5 concurrent). Normal jobs
+// (KVS, webhooks) use ≤2 slots; urgent relay commands may push to 4 total and
+// jump the queue. A budget race with the firmware backs off and retries —
+// pump() must NEVER throw (an uncaught throw here halted the script once).
+var Q = { inflight: 0, jobs: [], retryTimer: null, dispatching: false };
 
 function rpc(method, params, tag, cb) {
-  if (tag === "kvs blackbox") {
+  enq({ m: method, p: params, t: tag, cb: cb, u: false });
+}
+
+function rpcUrgent(method, params, tag) {
+  enq({ m: method, p: params, t: tag, u: true });
+}
+
+function enq(j) {
+  if (j.t === "kvs blackbox") {
     for (var i = 0; i < Q.jobs.length; i++) {
-      if (Q.jobs[i].t === tag) {
-        Q.jobs[i].p = params; // newer snapshot supersedes the queued one
+      if (Q.jobs[i].t === j.t) {
+        Q.jobs[i].p = j.p; // newer snapshot supersedes the queued one
         return;
       }
     }
   }
-  Q.jobs.push({ m: method, p: params, t: tag, cb: cb });
+  if (j.u) {
+    // ahead of normals but FIFO among urgents: relay command order is sacred
+    var k = 0;
+    while (k < Q.jobs.length && Q.jobs[k].u) k++;
+    Q.jobs.splice(k, 0, j);
+  } else {
+    Q.jobs.push(j);
+  }
   pump();
 }
 
 function pump() {
-  while (Q.inflight < 2 && Q.jobs.length > 0) {
-    var j = Q.jobs.splice(0, 1)[0];
-    Q.inflight++;
+  if (Q.jobs.length === 0) return;
+  if (Q.dispatching) return;
+  if (Q.inflight >= (Q.jobs[0].u ? 4 : 2)) return;
+  // fw 2.0.0: multiple Shelly.call dispatched in one synchronous tick clobber
+  // each other's params ("Missing required argument") — dispatch ONE per tick
+  Q.dispatching = true;
+  Timer.set(
+    1,
+    false,
+    guard("pump", function () {
+      Q.dispatching = false;
+      dispatchOne();
+      pump();
+    }),
+  );
+}
+
+function dispatchOne() {
+  if (Q.jobs.length === 0) return;
+  if (Q.inflight >= (Q.jobs[0].u ? 4 : 2)) return;
+  var j = Q.jobs.splice(0, 1)[0];
+  Q.inflight++;
+  try {
     Shelly.call(
       j.m,
       j.p,
       function (r, ec, em, ud) {
         Q.inflight--;
-        // never log blackbox failures: log() itself enqueues a blackbox write
-        if (ec !== 0 && ud.t !== "kvs blackbox") log(ud.t + " failed: " + em);
-        if (ud.cb) ud.cb(r, ec, em);
+        if (ec !== 0 && ud.t !== "kvs blackbox" && ud.t !== "webhook") {
+          ud.r = (ud.r || 0) + 1;
+          if (ud.r <= 2) {
+            log(ud.t + " failed (" + em + ") — retry " + ud.r);
+            enq(ud); // relay/KVS commands are idempotent
+          } else {
+            log(ud.t + " failed: " + em + " params=" + JSON.stringify(ud.p));
+          }
+        }
+        if (ud.cb && (ec === 0 || ud.r === undefined || ud.r > 2))
+          ud.cb(r, ec, em);
         pump();
       },
       j,
     );
+  } catch (e) {
+    Q.inflight--;
+    Q.jobs.unshift(j);
+    if (Q.retryTimer === null)
+      Q.retryTimer = Timer.set(100, false, function () {
+        Q.retryTimer = null;
+        pump();
+      });
   }
 }
 
@@ -144,7 +200,7 @@ function pushPos() {
       JSON.stringify(bottom),
   ];
   for (var i = 0; i < urls.length; i++) {
-    rpc("HTTP.GET", { url: urls[i], timeout: 5 }, "webhook");
+    rpc("HTTP.GET", { url: urls[i], timeout: 3 }, "webhook");
   }
 }
 
@@ -206,6 +262,8 @@ function fault(reason) {
   S.state = "FAULT";
   S.dir = null;
   S.latched = false;
+  S.calib = false;
+  S.calibPending = false;
 }
 
 function cooldown() {
@@ -220,6 +278,10 @@ function cooldown() {
       S.cdTimer = null;
       S.state = "IDLE";
       log("re-armed");
+      if (S.calibPending) {
+        S.calibPending = false;
+        startCalibTrip();
+      }
     }),
   );
 }
@@ -239,12 +301,55 @@ function hardReset(source) {
   bothOff();
   S.state = "IDLE";
   S.dir = null;
+  S.calib = false;
+  S.calibPending = false;
   S.forceLatch = false;
   S.latched = false;
   S.lastTapDir = null;
+  S.seqN = 0;
+  S.seqDir = null;
   S.stopping = false;
   S.onPending = null;
   S.runOnTs = 0;
+}
+
+// Calibration: full UP ride to the top limit; est becomes exactly 1 (100%).
+// Paddle inputs are IGNORED until Auto-Off completes it. Escape hatches:
+// UP+DOWN 3 s hold, ?cmd=stop, ?cmd=reset.
+function startCalibration(source) {
+  log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
+  S.calib = true;
+  S.lastTapDir = null;
+  S.forceLatch = false;
+  if (S.state === "RUNNING") {
+    if (S.dir === UP) {
+      S.latched = true; // already heading up: this run becomes the calibration
+      return "calibrating";
+    }
+    S.calibPending = true;
+    stopTrip("calibration: stop before UP ride");
+    return "calibrating";
+  }
+  if (S.state === "PENDING") {
+    clearTimers();
+    S.state = "IDLE";
+    S.dir = null;
+  }
+  if (S.state === "COOLDOWN") {
+    S.calibPending = true;
+    return "calibrating";
+  }
+  startCalibTrip();
+  return "calibrating";
+}
+
+function startCalibTrip() {
+  var r = request(UP, "calib");
+  if (r !== "accepted") {
+    S.calib = false;
+    S.calibPending = false;
+    log("calibration failed to start: " + r);
+  }
 }
 
 function armResetGesture() {
@@ -269,7 +374,28 @@ function request(dir, source) {
     return "fault";
   }
 
-  if (source === "input") log("press " + DIR_NAME[dir] + " (" + S.state + ")");
+  // calibration ride: paddle inputs are ignored until Auto-Off completes it
+  if (S.calib && source === "input") {
+    log("ignored " + DIR_NAME[dir] + ": calibration in progress");
+    return "calibrating";
+  }
+
+  if (source === "input") {
+    log("press " + DIR_NAME[dir] + " (" + S.state + ")");
+    // three rapid presses from idle = calibration; a stop of an older trip
+    // breaks the chain so stop/resume/stop fiddling can never trigger it
+    var chained = S.seqDir === dir && Date.now() - S.seqTs <= CFG.DBL_MS;
+    S.seqDir = dir;
+    S.seqTs = Date.now();
+    if (S.state === "RUNNING" && Date.now() - S.runOnTs > CFG.DBL_MS)
+      S.seqN = 0;
+    else S.seqN = chained ? S.seqN + 1 : 1;
+    if (S.seqN >= 3) {
+      S.seqN = 0;
+      S.seqDir = null;
+      return startCalibration(source);
+    }
+  }
 
   if (S.state === "RUNNING") {
     // any press during a run = stop (never reverse); quick follow-up press
@@ -320,7 +446,13 @@ function request(dir, source) {
   S.dir = dir;
   S.forceLatch = dbl;
   S.lastTapDir = null;
-  log(DIR_NAME[dir] + " pending (" + source + ")" + (dbl ? " [double-press]" : ""));
+  log(
+    DIR_NAME[dir] +
+      " pending (" +
+      source +
+      ")" +
+      (dbl ? " [double-press]" : ""),
+  );
   S.arbTimer = Timer.set(
     CFG.ARB_MS,
     false,
@@ -361,6 +493,7 @@ function release(dir) {
     Timer.clear(S.resetTimer);
     S.resetTimer = null;
   }
+  if (S.calib) return; // calibration ride ignores paddle releases too
   if (S.state === "PENDING" && dir === S.dir && !S.forceLatch) {
     // released inside the arbitration window — no motion, arms the double
     clearTimers();
@@ -439,6 +572,10 @@ Shelly.addStatusHandler(
       if (S.state === "RUNNING" && st.id === S.dir) {
         log("Auto-Off end of trip");
         atTerminal(st.id, "Auto-Off");
+        if (S.calib) {
+          S.calib = false;
+          log("CALIBRATION complete — at top, 100%");
+        }
         cooldown();
       }
     } else {
@@ -469,12 +606,16 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
 
   try {
     if (q.indexOf("cmd=stop") !== -1) {
+      S.calib = false;
+      S.calibPending = false; // http stop is a calibration escape hatch
       if (S.state === "RUNNING") {
         stopTrip("http stop");
         result = "stopped";
       } else {
         result = "not-running";
       }
+    } else if (q.indexOf("cmd=calibrate") !== -1) {
+      result = S.calib ? "already-calibrating" : startCalibration("http");
     } else if (q.indexOf("cmd=reset") !== -1) {
       hardReset("http");
       result = "reset";
@@ -508,7 +649,9 @@ HTTPServer.registerEndpoint("lift", function (req, res) {
     state: S.state,
     dir: S.dir === null ? null : DIR_NAME[S.dir],
     latched: S.latched,
+    calib: S.calib || S.calibPending,
     pos: S.pos,
+    pct: S.est === null ? null : Math.round(S.est * 100),
     est: S.est === null ? null : Math.round(S.est * 100) / 100,
   };
   if (result === "hist") body.hist = S.hist;
@@ -521,6 +664,8 @@ function init() {
   bothOff(); // fail-safe regardless of pre-boot state
   S.state = "IDLE";
   S.dir = null;
+  S.calib = false;
+  S.calibPending = false;
   S.forceLatch = false;
   S.latched = false;
 

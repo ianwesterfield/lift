@@ -186,7 +186,10 @@ test("rogue direct Switch.Set while IDLE => FAULT; cmd=reset recovers", () => {
   env.setOutputExternal(UP, true); // HomeKit bypass simulation
   env.advance(100);
   let st = env.http("");
-  assert(st.state === "FAULT", "unexpected ON did not FAULT: " + JSON.stringify(st));
+  assert(
+    st.state === "FAULT",
+    "unexpected ON did not FAULT: " + JSON.stringify(st),
+  );
   assert(!env.outputs[UP], "FAULT did not force outputs off");
   env.press(DOWN);
   env.advance(500);
@@ -232,6 +235,103 @@ test("stop racing auto-off does not strand the stopping flag", () => {
   baseline(env);
 });
 
+// ---------- calibration ----------
+
+test("triple-press = calibration: full UP ride, est=1, pos=top", () => {
+  const env = boot(); // est unknown
+  env.tap(UP, 80, 150);
+  env.tap(UP, 80, 150);
+  env.tap(UP, 80);
+  env.advance(500);
+  let st = env.http("");
+  assert(st.calib === true, "calibration not entered: " + JSON.stringify(st));
+  assert(env.outputs[UP], "calibration UP ride not running");
+  env.advance(60000); // Auto-Off completes the ride
+  st = env.http("");
+  assert(
+    st.calib === false && st.pos === "top" && st.pct === 100,
+    "calibration did not complete: " + JSON.stringify(st),
+  );
+  baseline(env);
+});
+
+test("calibration ignores paddle inputs until Auto-Off", () => {
+  const env = boot();
+  env.tap(UP, 80, 150);
+  env.tap(UP, 80, 150);
+  env.tap(UP, 80);
+  env.advance(2000);
+  assert(env.outputs[UP], "calibration not running");
+  env.tap(DOWN, 200, 100); // must be ignored
+  env.tap(UP, 200, 100); // must be ignored
+  env.press(DOWN);
+  env.advance(2000);
+  env.release(DOWN);
+  assert(env.outputs[UP], "paddle input interrupted the calibration ride");
+  env.advance(60000);
+  const st = env.http("");
+  assert(st.pos === "top" && st.calib === false, "calibration did not finish");
+  baseline(env);
+});
+
+test("triple-press during a DOWN trip: stop, cooldown, then UP calibration", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(100);
+  dbl(env, DOWN); // latched DOWN trip
+  // 3 rapid presses while the trip is young enough to chain from the dbl
+  env.tap(DOWN, 60, 150);
+  env.tap(DOWN, 60, 150);
+  env.tap(DOWN, 60);
+  env.advance(1500); // stop + cooldown + auto-start
+  const st = env.http("");
+  assert(st.calib === true, "calibration not entered from running trip");
+  assert(
+    env.outputs[UP] && !env.outputs[DOWN],
+    "UP calibration ride not running",
+  );
+  env.advance(60000);
+  assert(env.http("").pos === "top", "calibration did not complete");
+  baseline(env);
+});
+
+test("stop/resume/stop fiddling does NOT trigger calibration", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(100);
+  dbl(env, DOWN);
+  env.advance(5000); // trip is older than the gesture window
+  env.tap(DOWN, 80, 300); // stop (chain reset: old trip)
+  env.press(DOWN); // resume
+  env.advance(200);
+  env.release(DOWN);
+  env.advance(100);
+  env.tap(DOWN, 80); // stop again — must NOT calibrate
+  env.advance(1500);
+  const st = env.http("");
+  assert(
+    st.calib === false,
+    "fiddling triggered calibration: " + JSON.stringify(st),
+  );
+  assert(!env.outputs[UP], "calibration UP ride started from fiddling");
+  baseline(env);
+});
+
+test("slow RPC completions never exceed the firmware call limit", () => {
+  const env = boot();
+  env.rpcLatency = 250; // busy device: calls stay in flight a long time
+  env.http("set=top");
+  env.advance(1000);
+  dbl(env, DOWN); // trip start burst
+  env.advance(600);
+  env.tap(DOWN, 80, 300); // stop burst (bothOff + KVS + webhooks)
+  env.press(DOWN); // resume burst on top of pending calls
+  env.advance(300);
+  env.release(DOWN);
+  env.advance(3000);
+  baseline(env); // mock throws if >5 concurrent; crash recorded in env.crashed
+});
+
 // ---------- Konami fuzzer ----------
 
 function mulberry32(seed) {
@@ -268,7 +368,11 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     let st = env.http("");
     assert(
       st.state === "IDLE",
-      "iter " + iter + ": stuck in " + st.state + " hist=" +
+      "iter " +
+        iter +
+        ": stuck in " +
+        st.state +
+        " hist=" +
         JSON.stringify(env.http("cmd=hist").hist),
     );
     assert(
@@ -297,7 +401,10 @@ test("fuzz: literal Konami code (UU DD UD UD) mash", () => {
   env.advance(70000);
   const st = env.http("");
   assert(st.state === "IDLE", "Konami code stuck the arbiter in " + st.state);
-  assert(!env.outputs[UP] && !env.outputs[DOWN], "Konami code left an output on");
+  assert(
+    !env.outputs[UP] && !env.outputs[DOWN],
+    "Konami code left an output on",
+  );
   baseline(env);
 });
 

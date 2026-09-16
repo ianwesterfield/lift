@@ -38,8 +38,8 @@ Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip,
 
 States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. **No jog mode flag** — hold-to-run is the default interaction; a double-press latches. The second press of a double must land within 1 s.
 
-| Gesture                                              | Result                                                                       |
-| ---------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Gesture                                              | Result                                                                         |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
 | Press and **hold**                                   | Runs while held (starts after 75 ms arbitration); release = stop               |
 | Quick **tap** (< 400 ms)                             | Nudge at most (nothing if released within 75 ms); arms the double-press        |
 | **Double-press** (2nd press ≤ 1 s, same direction)   | **Latched full travel that direction, immediately** (Auto-Off/limits end it)   |
@@ -73,10 +73,11 @@ HTTP/HomeKit `?dir=` requests are always latched full trips.
 The script registers an HTTP endpoint (Gen2 scripts cannot register RPC methods; `HTTPServer.registerEndpoint` is the supported mechanism):
 
 ```
-http://192.168.40.105/script/1/lift             → status JSON {result, state, dir, latched, pos, est}
+http://192.168.40.105/script/1/lift             → status JSON {result, state, dir, latched, calib, pos, pct, est}
 http://192.168.40.105/script/1/lift?dir=up      → request UP (same arbiter path as buttons)
 http://192.168.40.105/script/1/lift?dir=down    → request DOWN
-http://192.168.40.105/script/1/lift?cmd=stop    → stop a running trip
+http://192.168.40.105/script/1/lift?cmd=stop    → stop a running trip (also aborts calibration)
+http://192.168.40.105/script/1/lift?cmd=calibrate → full-UP calibration ride (paddle locked until done)
 http://192.168.40.105/script/1/lift?cmd=reset   → hard state reset (any state incl. FAULT; keeps position)
 http://192.168.40.105/script/1/lift?cmd=hist    → status + last 15 log lines (diagnostics)
 http://192.168.40.105/script/1/lift?set=top|bottom|mid → manual position calibration (IDLE only)

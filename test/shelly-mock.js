@@ -15,6 +15,7 @@ function createEnv() {
     queue: [], // {t, seq, fn}
     timers: new Map(),
     tid: 1,
+    rpcLatency: 5, // ms until an RPC completes (raise to simulate a busy device)
     inflight: 0,
     maxInflightSeen: 0,
     outputs: [false, false, false],
@@ -56,16 +57,26 @@ function createEnv() {
 
   const Shelly = {
     call(method, params, cb, ud) {
+      if (typeof params === "string") params = JSON.parse(params);
+      // fw 2.0.0 quirk: a second call dispatched in the same tick clobbers the
+      // params of the earlier one (observed on the real Pro 3)
+      if (env.lastCall && env.lastCall.t === env.now)
+        env.lastCall.clobbered = true;
+      const rec = { t: env.now, clobbered: false };
+      env.lastCall = rec;
       env.inflight++;
       env.maxInflightSeen = Math.max(env.maxInflightSeen, env.inflight);
       if (env.inflight > MAX_INFLIGHT)
         throw new Error("Too many calls in progress");
-      schedule(5, () => {
+      schedule(env.rpcLatency, () => {
         env.inflight--;
         let result = null,
           ec = 0,
           em = "";
-        if (method === "Switch.Set") setOutput(params.id, params.on);
+        if (rec.clobbered) {
+          ec = -103;
+          em = "Missing required argument!";
+        } else if (method === "Switch.Set") setOutput(params.id, params.on);
         else if (method === "KVS.Set") env.kvs[params.key] = params.value;
         else if (method === "KVS.Get") {
           if (params.key in env.kvs) result = { value: env.kvs[params.key] };
