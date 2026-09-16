@@ -40,21 +40,21 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. A `j
 
 ### Normal mode
 
-| Gesture                                  | Result                                                                       |
-| ---------------------------------------- | ---------------------------------------------------------------------------- |
-| Single press                             | Latched full trip, starting after the 1 s gesture window (Auto-Off ends it)  |
-| Two presses                              | Pending trip cancelled — no motion (doubles as the "oops, abort" gesture)    |
-| **Three presses**                        | **Jog mode ON** — no motion                                                  |
-| Opposite press within the pending window | Trip cancelled, neither output fires, cooldown                               |
-| **Any** press during a running trip      | **STOP** (never reverse), cooldown — stays in normal mode                    |
+| Gesture                                  | Result                                                                      |
+| ---------------------------------------- | --------------------------------------------------------------------------- |
+| Single press                             | Latched full trip, starting after the 1 s gesture window (Auto-Off ends it) |
+| Two presses                              | Pending trip cancelled — no motion (doubles as the "oops, abort" gesture)   |
+| **Three presses**                        | **Jog mode ON** — no motion                                                 |
+| Opposite press within the pending window | Trip cancelled, neither output fires, cooldown                              |
+| **Any** press during a running trip      | **STOP** (never reverse), cooldown — stays in normal mode                   |
 
 ### Jog mode (fine positioning — persists until a three-press sequence)
 
-| Gesture                                              | Result                                                            |
-| ---------------------------------------------------- | ------------------------------------------------------------------ |
-| Press and **hold**                                   | Output on while held (75 ms arbitration); release = stop           |
-| **Three presses**                                    | **Jog mode OFF** — no motion; a single press then = full trip      |
-| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared; jog mode **persists** until a triple-press         |
+| Gesture                                              | Result                                                        |
+| ---------------------------------------------------- | ------------------------------------------------------------- |
+| Press and **hold**                                   | Output on while held (75 ms arbitration); release = stop      |
+| **Three presses**                                    | **Jog mode OFF** — no motion; a single press then = full trip |
+| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared; jog mode **persists** until a triple-press    |
 
 HTTP/HomeKit requests are always latched full trips in either mode (75 ms window only); `?cmd=jog` toggles jog mode remotely. Hold UP+DOWN 3 s = hard reset from any state.
 

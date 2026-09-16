@@ -44,7 +44,10 @@ const UP = 0,
 test("boot: outputs off, IDLE, normal mode", () => {
   const env = boot();
   const st = env.http("");
-  assert(st.state === "IDLE" && !st.jog, "not idle/normal: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE" && !st.jog,
+    "not idle/normal: " + JSON.stringify(st),
+  );
   assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs not off");
   baseline(env);
 });
@@ -57,7 +60,10 @@ test("single press = latched full trip, Auto-Off ends at top", () => {
   env.advance(60000); // ride out auto-off
   const st = env.http("");
   assert(!env.outputs[UP], "output still on after auto-off");
-  assert(st.state === "IDLE" && st.pos === "top" && st.est === 1, "not at top: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE" && st.pos === "top" && st.est === 1,
+    "not at top: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -70,7 +76,10 @@ test("press during trip = stop, stays normal mode", () => {
   env.advance(1000);
   const st = env.http("");
   assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs not off after stop");
-  assert(st.state === "IDLE" && !st.jog, "should stay normal-mode IDLE: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE" && !st.jog,
+    "should stay normal-mode IDLE: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -79,7 +88,10 @@ test("opposite press during pending window = conflict, no motion", () => {
   env.tap(UP, 50, 100);
   env.tap(DOWN, 50);
   env.advance(3000);
-  assert(!env.outputs[UP] && !env.outputs[DOWN], "motion after UP/DOWN conflict");
+  assert(
+    !env.outputs[UP] && !env.outputs[DOWN],
+    "motion after UP/DOWN conflict",
+  );
   assert(env.http("").state === "IDLE", "not idle after conflict");
   baseline(env);
 });
@@ -91,7 +103,10 @@ test("double press = trip cancelled, no jog, no motion", () => {
   env.advance(3000);
   const st = env.http("");
   assert(!env.outputs[UP], "motion after 2-press cancel");
-  assert(!st.jog && st.state === "IDLE", "unexpected state: " + JSON.stringify(st));
+  assert(
+    !st.jog && st.state === "IDLE",
+    "unexpected state: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -109,7 +124,10 @@ test("triple press = jog ON, no motion; triple again = jog OFF", () => {
   env.tap(UP, 60);
   env.advance(2000);
   st = env.http("");
-  assert(st.jog === false, "jog not off after 2nd triple: " + JSON.stringify(st));
+  assert(
+    st.jog === false,
+    "jog not off after 2nd triple: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -138,7 +156,10 @@ test("jog persists at limit only via est=null; declared floor keeps jog until tr
   env.release(DOWN);
   env.advance(1000);
   const st = env.http("");
-  assert(st.pos === "bottom", "auto-off run should declare bottom: " + JSON.stringify(st));
+  assert(
+    st.pos === "bottom",
+    "auto-off run should declare bottom: " + JSON.stringify(st),
+  );
   assert(st.jog === true, "jog must persist until triple-press");
   baseline(env);
 });
@@ -162,7 +183,10 @@ test("dead reckoning: mid-trip stop tracks est; jog to floor declares it", () =>
   env.release(DOWN);
   env.advance(1000);
   st = env.http("");
-  assert(st.pos === "bottom" && st.est === 0, "jog to limit not declared: " + JSON.stringify(st));
+  assert(
+    st.pos === "bottom" && st.est === 0,
+    "jog to limit not declared: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -175,7 +199,10 @@ test("near-simultaneous UP+DOWN = no motion ever", () => {
   env.release(UP);
   env.release(DOWN);
   env.advance(3000);
-  assert(!env.outputs[UP] && !env.outputs[DOWN], "motion after simultaneous press");
+  assert(
+    !env.outputs[UP] && !env.outputs[DOWN],
+    "motion after simultaneous press",
+  );
   baseline(env);
 });
 
@@ -190,7 +217,10 @@ test("hold UP+DOWN 3s = hard reset (clears jog)", () => {
   env.release(DOWN);
   env.advance(1000);
   const st = env.http("");
-  assert(st.state === "IDLE" && st.jog === false, "reset gesture failed: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE" && st.jog === false,
+    "reset gesture failed: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -199,7 +229,10 @@ test("rogue direct Switch.Set while IDLE => FAULT on next press; cmd=reset recov
   env.setOutputExternal(UP, true); // HomeKit bypass simulation
   env.advance(100);
   let st = env.http("");
-  assert(st.state === "FAULT", "unexpected ON did not FAULT: " + JSON.stringify(st));
+  assert(
+    st.state === "FAULT",
+    "unexpected ON did not FAULT: " + JSON.stringify(st),
+  );
   assert(!env.outputs[UP], "FAULT did not force outputs off");
   env.tap(DOWN, 100);
   env.advance(2000);
@@ -238,7 +271,10 @@ test("stop racing auto-off does not strand the stopping flag", () => {
   env.tap(DOWN, 100);
   env.advance(1100 + 46000);
   const st = env.http("");
-  assert(st.pos === "bottom", "follow-up trip did not declare floor: " + JSON.stringify(st));
+  assert(
+    st.pos === "bottom",
+    "follow-up trip did not declare floor: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 
@@ -278,9 +314,17 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     let st = env.http("");
     assert(
       st.state === "IDLE",
-      "iter " + iter + ": stuck in " + st.state + " hist=" + JSON.stringify(env.http("cmd=hist").hist),
+      "iter " +
+        iter +
+        ": stuck in " +
+        st.state +
+        " hist=" +
+        JSON.stringify(env.http("cmd=hist").hist),
     );
-    assert(!env.outputs[UP] && !env.outputs[DOWN], "iter " + iter + ": output stuck on");
+    assert(
+      !env.outputs[UP] && !env.outputs[DOWN],
+      "iter " + iter + ": output stuck on",
+    );
 
     // recoverability: exit jog if needed, then a single press must run a trip
     if (st.jog) {
@@ -294,10 +338,16 @@ test("fuzz: 250 random button-mash sequences, always recoverable", () => {
     const dir = st.pos === "top" ? DOWN : UP;
     env.tap(dir, 100);
     env.advance(1200);
-    assert(env.outputs[dir], "iter " + iter + ": recovery press did not start a trip");
+    assert(
+      env.outputs[dir],
+      "iter " + iter + ": recovery press did not start a trip",
+    );
     env.advance(60000);
     st = env.http("");
-    assert(st.state === "IDLE" && !env.outputs[dir], "iter " + iter + ": recovery trip did not finish");
+    assert(
+      st.state === "IDLE" && !env.outputs[dir],
+      "iter " + iter + ": recovery trip did not finish",
+    );
     baseline(env);
   }
 });
@@ -309,7 +359,10 @@ test("fuzz: literal Konami code (UU DD UD UD) mash", () => {
   env.advance(70000);
   const st = env.http("");
   assert(st.state === "IDLE", "Konami code stuck the arbiter in " + st.state);
-  assert(!env.outputs[UP] && !env.outputs[DOWN], "Konami code left an output on");
+  assert(
+    !env.outputs[UP] && !env.outputs[DOWN],
+    "Konami code left an output on",
+  );
   baseline(env);
 });
 

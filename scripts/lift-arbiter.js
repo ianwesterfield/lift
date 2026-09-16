@@ -18,6 +18,7 @@ var CFG = {
   LIMIT_IN: 2, // S3: optional "at a terminal" feedback (active when input:2 enabled)
   POS_KEY: "lift.pos", // KVS key for persisted position
   EST_KEY: "lift.est", // KVS key for persisted travel estimate
+  LOG_KEY: "lift.blackbox", // KVS: last hist lines, survives script restarts
   HB_WEBHOOK: "http://192.168.10.175:51828", // homebridge-http-webhooks listener
 };
 
@@ -51,6 +52,28 @@ function log(msg) {
   print("[lift] " + msg);
   S.hist.push(Math.round(Date.now() / 1000) + " " + msg);
   if (S.hist.length > 15) S.hist.splice(0, 1);
+  // black box: persist the tail so a script restart can't destroy evidence
+  rpc(
+    "KVS.Set",
+    { key: CFG.LOG_KEY, value: S.hist.join(" | ").slice(-250) },
+    "kvs blackbox",
+  );
+}
+
+// Any uncaught exception in a handler must degrade to FAULT (outputs OFF,
+// buttons in lockout) instead of a dead script with dead detached inputs.
+function guard(name, fn) {
+  return function (a, b, c, d) {
+    try {
+      return fn(a, b, c, d);
+    } catch (e) {
+      try {
+        fault("exception in " + name + ": " + e.message);
+      } catch (e2) {
+        bothOff(); // last resort
+      }
+    }
+  };
 }
 
 function outOn(id) {
@@ -67,14 +90,21 @@ function setOut(id, on) {
   Shelly.call("Switch.Set", { id: id, on: on });
 }
 
-// Firmware allows ~5 concurrent outbound calls; a terminal declaration bursts 6
-// (2x Switch.Set + 2x KVS.Set + 2x webhook) and crashes the script ("Too many
-// calls in progress"). Switch.Set stays direct (≤2 at once, never delayed);
-// everything else shares 2 queue slots => ≤4 concurrent total.
+// Firmware allows ~5 concurrent outbound calls. Switch.Set stays direct (≤2
+// at once, never delayed); ALL other RPC goes through 2 queue slots => ≤4
+// concurrent total. Blackbox log writes coalesce to at most one queued job.
 var Q = { inflight: 0, jobs: [] };
 
-function rpc(method, params, tag) {
-  Q.jobs.push({ m: method, p: params, t: tag });
+function rpc(method, params, tag, cb) {
+  if (tag === "kvs blackbox") {
+    for (var i = 0; i < Q.jobs.length; i++) {
+      if (Q.jobs[i].t === tag) {
+        Q.jobs[i].p = params; // newer snapshot supersedes the queued one
+        return;
+      }
+    }
+  }
+  Q.jobs.push({ m: method, p: params, t: tag, cb: cb });
   pump();
 }
 
@@ -87,10 +117,12 @@ function pump() {
       j.p,
       function (r, ec, em, ud) {
         Q.inflight--;
-        if (ec !== 0) log(ud + " failed: " + em);
+        // never log blackbox failures: log() itself enqueues a blackbox write
+        if (ec !== 0 && ud.t !== "kvs blackbox") log(ud.t + " failed: " + em);
+        if (ud.cb) ud.cb(r, ec, em);
         pump();
       },
-      j.t,
+      j,
     );
   }
 }
@@ -184,11 +216,15 @@ function cooldown() {
   S.state = "COOLDOWN";
   S.dir = null;
   S.latched = false;
-  S.cdTimer = Timer.set(CFG.COOLDOWN_MS, false, function () {
-    S.cdTimer = null;
-    S.state = "IDLE";
-    log("re-armed" + (S.jog ? " (jog mode)" : ""));
-  });
+  S.cdTimer = Timer.set(
+    CFG.COOLDOWN_MS,
+    false,
+    guard("cdTimer", function () {
+      S.cdTimer = null;
+      S.state = "IDLE";
+      log("re-armed" + (S.jog ? " (jog mode)" : ""));
+    }),
+  );
 }
 
 function stopTrip(reason) {
@@ -217,10 +253,14 @@ function hardReset(source) {
 
 function armResetGesture() {
   if (S.resetTimer !== null) return;
-  S.resetTimer = Timer.set(CFG.RESET_HOLD_MS, false, function () {
-    S.resetTimer = null;
-    if (inOn(UP) && inOn(DOWN)) hardReset("both buttons held");
-  });
+  S.resetTimer = Timer.set(
+    CFG.RESET_HOLD_MS,
+    false,
+    guard("resetTimer", function () {
+      S.resetTimer = null;
+      if (inOn(UP) && inOn(DOWN)) hardReset("both buttons held");
+    }),
+  );
 }
 
 // Single entry point for ALL request sources (physical inputs, HTTP/HomeKit).
@@ -299,10 +339,14 @@ function request(dir, source) {
   // use the short arbitration window only
   var wait = !S.jog && source === "input" ? CFG.DBL_MS : CFG.ARB_MS;
   log(DIR_NAME[dir] + " pending (" + source + ")");
-  S.arbTimer = Timer.set(wait, false, function () {
-    S.arbTimer = null;
-    startTrip(source);
-  });
+  S.arbTimer = Timer.set(
+    wait,
+    false,
+    guard("arbTimer", function () {
+      S.arbTimer = null;
+      startTrip(source);
+    }),
+  );
   return "accepted";
 }
 
@@ -346,17 +390,19 @@ function release(dir) {
   }
 }
 
-Shelly.addEventHandler(function (ev) {
-  if (!ev.info || ev.info.event !== "toggle") return;
-  if (ev.component === "input:" + CFG.LIMIT_IN) {
-    if (S.limitFb && ev.info.state === true) limitHit();
-    return;
-  }
-  if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN)
-    return;
-  if (ev.info.state === true) request(ev.info.id, "input");
-  else release(ev.info.id);
-});
+Shelly.addEventHandler(
+  guard("eventHandler", function (ev) {
+    if (!ev.info || ev.info.event !== "toggle") return;
+    if (ev.component === "input:" + CFG.LIMIT_IN) {
+      if (S.limitFb && ev.info.state === true) limitHit();
+      return;
+    }
+    if (ev.component !== "input:" + UP && ev.component !== "input:" + DOWN)
+      return;
+    if (ev.info.state === true) request(ev.info.id, "input");
+    else release(ev.info.id);
+  }),
+);
 
 // S3: platform physically reached a terminal; direction of travel disambiguates
 function limitHit() {
@@ -373,93 +419,100 @@ function limitHit() {
   }
 }
 
-Shelly.addStatusHandler(function (st) {
-  if (st.name !== "switch" || (st.id !== UP && st.id !== DOWN)) return;
-  if (!st.delta || st.delta.output === undefined) return;
+Shelly.addStatusHandler(
+  guard("statusHandler", function (st) {
+    if (st.name !== "switch" || (st.id !== UP && st.id !== DOWN)) return;
+    if (!st.delta || st.delta.output === undefined) return;
 
-  if (outOn(UP) && outOn(DOWN)) {
-    fault("both outputs ON");
-    return;
-  }
-
-  if (st.delta.output === false) {
-    // integrate actual energized time regardless of why it ended
-    if (S.runOnTs !== 0 && st.id === S.lastRunDir) {
-      updateEst(st.id, Date.now() - S.runOnTs);
-      S.runOnTs = 0;
-    }
-    if (S.stopping) {
-      S.stopping = false;
-      declareFromEst(); // manual stop may still have landed on a floor
+    if (outOn(UP) && outOn(DOWN)) {
+      fault("both outputs ON");
       return;
     }
-    if (S.state === "RUNNING" && st.id === S.dir) {
-      log("Auto-Off end of trip");
-      atTerminal(st.id, "Auto-Off");
-      cooldown();
+
+    if (st.delta.output === false) {
+      // integrate actual energized time regardless of why it ended
+      if (S.runOnTs !== 0 && st.id === S.lastRunDir) {
+        updateEst(st.id, Date.now() - S.runOnTs);
+        S.runOnTs = 0;
+      }
+      if (S.stopping) {
+        S.stopping = false;
+        declareFromEst(); // manual stop may still have landed on a floor
+        return;
+      }
+      if (S.state === "RUNNING" && st.id === S.dir) {
+        log("Auto-Off end of trip");
+        atTerminal(st.id, "Auto-Off");
+        cooldown();
+      }
+    } else {
+      if (st.id === S.onPending) {
+        // our own commanded-ON echo; if a stop already landed, the off-command
+        // is in flight and its off-event follows — not a fault
+        S.onPending = null;
+        return;
+      }
+      // stale ON event: we may have already commanded the output off
+      if (!outOn(st.id)) return;
+      if (S.state !== "RUNNING" || st.id !== S.dir) {
+        fault(
+          "unexpected output ON: switch:" +
+            st.id +
+            " source=" +
+            (st.delta.source ? st.delta.source : "?"),
+        );
+      }
     }
-  } else {
-    if (st.id === S.onPending) {
-      // our own commanded-ON echo; if a stop already landed, the off-command
-      // is in flight and its off-event follows — not a fault
-      S.onPending = null;
-      return;
-    }
-    // stale ON event: we may have already commanded the output off
-    if (!outOn(st.id)) return;
-    if (S.state !== "RUNNING" || st.id !== S.dir) {
-      fault(
-        "unexpected output ON: switch:" +
-          st.id +
-          " source=" +
-          (st.delta.source ? st.delta.source : "?"),
-      );
-    }
-  }
-});
+  }),
+);
 
 // HomeKit/remote entry: http://<ip>/script/<id>/lift?dir=up|down | ?cmd=stop|reset|jog|hist
 HTTPServer.registerEndpoint("lift", function (req, res) {
   var q = req.query ? req.query : "";
   var result = "status";
 
-  if (q.indexOf("cmd=stop") !== -1) {
-    if (S.state === "RUNNING") {
-      stopTrip("http stop");
-      result = "stopped";
-    } else {
-      result = "not-running";
+  try {
+    if (q.indexOf("cmd=stop") !== -1) {
+      if (S.state === "RUNNING") {
+        stopTrip("http stop");
+        result = "stopped";
+      } else {
+        result = "not-running";
+      }
+    } else if (q.indexOf("cmd=jog") !== -1) {
+      if (S.state === "IDLE" || S.state === "COOLDOWN") {
+        S.jog = !S.jog;
+        log("jog mode " + (S.jog ? "ON" : "OFF") + " (http)");
+        result = S.jog ? "jog-on" : "jog-off";
+      } else {
+        result = "jog-refused";
+      }
+    } else if (q.indexOf("cmd=reset") !== -1) {
+      hardReset("http");
+      result = "reset";
+    } else if (q.indexOf("cmd=hist") !== -1) {
+      result = "hist";
+    } else if (q.indexOf("dir=up") !== -1) {
+      result = request(UP, "http");
+    } else if (q.indexOf("dir=down") !== -1) {
+      result = request(DOWN, "http");
+    } else if (q.indexOf("set=") !== -1) {
+      // manual position calibration, only while stationary
+      var p = null;
+      if (q.indexOf("set=top") !== -1) p = "top";
+      else if (q.indexOf("set=bottom") !== -1) p = "bottom";
+      else if (q.indexOf("set=mid") !== -1) p = "mid";
+      if (p !== null && S.state === "IDLE") {
+        setEst(p === "top" ? 1 : p === "bottom" ? 0 : null);
+        setPos(p);
+        result = "calibrated";
+      } else {
+        result = "set-refused";
+      }
     }
-  } else if (q.indexOf("cmd=jog") !== -1) {
-    if (S.state === "IDLE" || S.state === "COOLDOWN") {
-      S.jog = !S.jog;
-      log("jog mode " + (S.jog ? "ON" : "OFF") + " (http)");
-      result = S.jog ? "jog-on" : "jog-off";
-    } else {
-      result = "jog-refused";
-    }
-  } else if (q.indexOf("cmd=reset") !== -1) {
-    hardReset("http");
-    result = "reset";
-  } else if (q.indexOf("cmd=hist") !== -1) {
-    result = "hist";
-  } else if (q.indexOf("dir=up") !== -1) {
-    result = request(UP, "http");
-  } else if (q.indexOf("dir=down") !== -1) {
-    result = request(DOWN, "http");
-  } else if (q.indexOf("set=") !== -1) {
-    // manual position calibration, only while stationary
-    var p = null;
-    if (q.indexOf("set=top") !== -1) p = "top";
-    else if (q.indexOf("set=bottom") !== -1) p = "bottom";
-    else if (q.indexOf("set=mid") !== -1) p = "mid";
-    if (p !== null && S.state === "IDLE") {
-      setEst(p === "top" ? 1 : p === "bottom" ? 0 : null);
-      setPos(p);
-      result = "calibrated";
-    } else {
-      result = "set-refused";
-    }
+  } catch (e) {
+    fault("exception in http handler: " + e.message);
+    result = "error";
   }
 
   var body = {
@@ -483,12 +536,12 @@ function init() {
   S.jog = false;
   S.latched = false;
 
-  Shelly.call("KVS.Get", { key: CFG.POS_KEY }, function (r, ec) {
+  rpc("KVS.Get", { key: CFG.POS_KEY }, "kvs get pos", function (r, ec) {
     if (ec === 0 && r && typeof r.value === "string") S.pos = r.value;
     log("position restored: " + S.pos);
     pushPos(); // sync Homebridge sensors with reality at boot
   });
-  Shelly.call("KVS.Get", { key: CFG.EST_KEY }, function (r, ec) {
+  rpc("KVS.Get", { key: CFG.EST_KEY }, "kvs get est", function (r, ec) {
     if (ec === 0 && r && r.value !== "" && typeof r.value === "string") {
       var e = JSON.parse(r.value);
       if (typeof e === "number") S.est = e;
