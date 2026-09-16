@@ -50,6 +50,7 @@ var S = {
   arbTimer: null,
   cdTimer: null,
   resetTimer: null,
+  holdTimer: null, // single-paddle lockout-escape hold
   limitFb: false, // S3 hardware limit feedback available
   hist: [], // ring buffer of recent log lines for ?cmd=hist
   pos: "unknown", // top | bottom | mid | unknown
@@ -298,9 +299,26 @@ function armResetGesture() {
   );
 }
 
+// Rocker paddle can't press both directions at once, so lockout states need a
+// one-button escape: hold EITHER paddle ≥ RESET_HOLD_MS during FAULT or a
+// calibration ride = hard reset. Never armed in normal states, so leaning on
+// the paddle during a run can't trigger it (runs are latched anyway).
+function armHoldEscape(dir) {
+  if (S.holdTimer !== null) return;
+  S.holdTimer = Timer.set(
+    CFG.RESET_HOLD_MS,
+    false,
+    guard("holdTimer", function () {
+      S.holdTimer = null;
+      if (inOn(dir) && (S.state === "FAULT" || S.calib || S.calibPending))
+        hardReset("paddle held in lockout");
+    }),
+  );
+}
+
 // Calibration: full UP ride to the top limit; est becomes exactly 1 (100%).
 // Paddle inputs are IGNORED until Auto-Off completes it, then normal service
-// resumes at top/100%. Escapes: UP+DOWN 3 s hold, ?cmd=stop, ?cmd=reset.
+// resumes at top/100%. Escapes: hold either paddle 3 s, ?cmd=stop, ?cmd=reset.
 function startCalibration(source) {
   log("CALIBRATION (" + source + "): full UP, paddle locked until Auto-Off");
   S.calib = true;
@@ -338,8 +356,11 @@ function startCalibTrip() {
 // Gestures (rev 8): single press = latched full run. During a run a lone press
 // is ignored; a chained 2nd press (≤ DBL_MS) stops; a chained 3rd = calibration.
 function request(dir, source) {
-  // reset gesture works from ANY state, including FAULT
-  if (source === "input" && inOn(UP) && inOn(DOWN)) armResetGesture();
+  // reset gestures work from ANY state, including FAULT and calibration
+  if (source === "input") {
+    if (inOn(UP) && inOn(DOWN)) armResetGesture();
+    if (S.state === "FAULT" || S.calib || S.calibPending) armHoldEscape(dir);
+  }
 
   if (S.state === "FAULT") {
     log("ignored " + DIR_NAME[dir] + " (" + source + "): FAULT lockout");
@@ -443,6 +464,10 @@ function release(dir) {
   if (S.resetTimer !== null) {
     Timer.clear(S.resetTimer);
     S.resetTimer = null;
+  }
+  if (S.holdTimer !== null) {
+    Timer.clear(S.holdTimer);
+    S.holdTimer = null;
   }
   // rev 8: all runs are latched; releases carry no other meaning
 }

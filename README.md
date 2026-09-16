@@ -46,9 +46,11 @@ States: `IDLE → PENDING → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. All 
 | **Triple-press** (3 chained presses)                 | **Calibration**: full-UP ride, paddle IGNORED until Auto-Off → top / 100%      |
 | Opposite press within the 75 ms arbitration window   | Cancelled, neither output fires, cooldown                                      |
 | Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                 |
-| Hold **UP+DOWN 3 s**                                 | Hard reset from any state (incl. FAULT and calibration); keeps position        |
+| **Hold either paddle 3 s during FAULT/calibration**  | **Hard reset / lockout escape** (keeps position). Never triggers in normal use — runs are latched, so leaning on the paddle is meaningless |
 
-Calibration exits back to normal service automatically when the ride completes at the top. Triple on the DOWN paddle stops the run, waits out the cooldown, then rides UP. Escapes during the locked ride: UP+DOWN hold, `?cmd=stop`, `?cmd=reset`. Note: a 3rd chained press right after a double-press interrupt IS the calibration gesture — pause > 0.5 s after an interrupt before commanding a new run.
+The physical control is a rocker — one person cannot press UP+DOWN together (that gesture still exists in code and would require two stations pressed simultaneously). The single-paddle hold is the practical lockout escape.
+
+Calibration exits back to normal service automatically when the ride completes at the top. Triple on the DOWN paddle stops the run, waits out the cooldown, then rides UP. Escapes during the locked ride: hold either paddle 3 s, `?cmd=stop`, `?cmd=reset`. Note: a 3rd chained press right after a double-press interrupt IS the calibration gesture — pause > 0.5 s after an interrupt before commanding a new run.
 
 HTTP/HomeKit `?dir=` requests are always latched full runs; `?cmd=calibrate` triggers the calibration ride.
 

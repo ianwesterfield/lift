@@ -218,6 +218,57 @@ test("hold UP+DOWN 3s = hard reset (aborts calibration too)", () => {
   baseline(env);
 });
 
+test("rocker escape: hold ONE paddle 3s aborts calibration", () => {
+  const env = boot();
+  env.tap(UP, 60, 150);
+  env.tap(UP, 60, 150);
+  env.tap(UP, 60);
+  env.advance(1000); // calibration running
+  env.press(DOWN);
+  env.advance(3300);
+  env.release(DOWN);
+  env.advance(1000);
+  const st = env.http("");
+  assert(
+    st.state === "IDLE" && st.calib === false,
+    "hold escape failed: " + JSON.stringify(st),
+  );
+  assert(!env.outputs[UP] && !env.outputs[DOWN], "outputs on after escape");
+  go(env, DOWN); // normal service resumes
+  assert(env.outputs[DOWN], "no run after hold escape");
+  env.advance(50000);
+  baseline(env);
+});
+
+test("rocker escape: hold ONE paddle 3s clears FAULT", () => {
+  const env = boot();
+  env.setOutputExternal(UP, true);
+  env.advance(2500);
+  env.tap(DOWN, 80);
+  env.advance(500);
+  assert(env.http("").state === "FAULT", "did not FAULT");
+  env.press(DOWN);
+  env.advance(3300);
+  env.release(DOWN);
+  env.advance(500);
+  assert(env.http("").state === "IDLE", "hold escape did not clear FAULT");
+  baseline(env);
+});
+
+test("hold during a NORMAL run never resets (latched run continues)", () => {
+  const env = boot();
+  env.http("set=top");
+  env.advance(200);
+  env.press(DOWN); // start run and keep leaning on the paddle
+  env.advance(10000);
+  assert(env.outputs[DOWN], "leaning on the paddle disturbed the run");
+  assert(env.http("").state === "RUNNING", "state lost during lean");
+  env.release(DOWN);
+  env.advance(40000);
+  assert(env.http("").pos === "bottom", "run did not complete");
+  baseline(env);
+});
+
 test("rogue direct Switch.Set while IDLE => FAULT; cmd=reset recovers", () => {
   const env = boot();
   env.setOutputExternal(UP, true);
