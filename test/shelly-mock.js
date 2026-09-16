@@ -114,7 +114,7 @@ function createEnv() {
   const Timer = {
     set(ms, repeat, fn) {
       const id = env.tid++;
-      env.timers.set(id, { t: env.now + ms, fn });
+      env.timers.set(id, { t: env.now + ms, ms, repeat: !!repeat, fn });
       return id;
     },
     clear(id) {
@@ -173,7 +173,9 @@ function createEnv() {
           env.queue.splice(env.queue.indexOf(next.ref), 1);
           next.ref.fn();
         } else if (next.kind === "timer") {
-          env.timers.delete(next.ref.id);
+          const rec = env.timers.get(next.ref.id);
+          if (rec && rec.repeat) rec.t = env.now + rec.ms;
+          else env.timers.delete(next.ref.id);
           next.ref.fn();
         } else {
           const id = next.ref;

@@ -43,6 +43,8 @@ var S = {
   runOnTs: 0, // when the output actually energized (dead reckoning)
   lastRunDir: null,
   onPending: null, // switch id whose commanded-ON status echo is still in flight
+  cmd: [false, false], // commanded output intent (hardware lags via the queue)
+  offTs: [0, 0], // when each OFF was commanded (grace for queue lag)
   est: null, // 0=bottom..1=top travel estimate; null until first known floor
   stopping: false, // we commanded OFF; swallow the resulting status event
   arbTimer: null,
@@ -92,14 +94,23 @@ function inOn(id) {
 }
 
 function setOut(id, on) {
+  S.cmd[id] = on; // intent, set synchronously; hardware lags by queue ticks
+  if (!on) S.offTs[id] = Date.now();
   rpcUrgent("Switch.Set", { id: id, on: on }, "switch");
+}
+
+// physically ON with no command intent and no recent OFF still landing
+function rogueOn() {
+  for (var i = UP; i <= DOWN; i++) {
+    if (outOn(i) && !S.cmd[i] && Date.now() - S.offTs[i] > 2000) return true;
+  }
+  return false;
 }
 
 // One budget for ALL script RPC (firmware caps ~5 concurrent). Normal jobs
 // (KVS, webhooks) use ≤2 slots; urgent relay commands may push to 4 total and
-// jump the queue. A budget race with the firmware backs off and retries —
-// pump() must NEVER throw (an uncaught throw here halted the script once).
-var Q = { inflight: 0, jobs: [], retryTimer: null, dispatching: false };
+// jump the queue.
+var Q = { inflight: 0, jobs: [] };
 
 function rpc(method, params, tag, cb) {
   enq({ m: method, p: params, t: tag, cb: cb, u: false });
@@ -126,28 +137,14 @@ function enq(j) {
   } else {
     Q.jobs.push(j);
   }
-  pump();
 }
 
-function pump() {
-  if (Q.jobs.length === 0) return;
-  if (Q.dispatching) return;
-  if (Q.inflight >= (Q.jobs[0].u ? 4 : 2)) return;
-  // fw 2.0.0: multiple Shelly.call dispatched in one synchronous tick clobber
-  // each other's params ("Missing required argument") — dispatch ONE per tick
-  Q.dispatching = true;
-  Timer.set(
-    1,
-    false,
-    guard("pump", function () {
-      Q.dispatching = false;
-      dispatchOne();
-      pump();
-    }),
-  );
-}
-
-function dispatchOne() {
+// Flat, recursion-free drain. fw 2.0.0 clobbers params of Shelly.calls
+// dispatched in the same synchronous tick, and creating timers/closures deep
+// in handler stacks overflows mJS's small stack ("Too much recursion" halted
+// the script once). So: ONE repeating timer, at most one dispatch per tick,
+// nothing dispatches from callbacks or enq.
+Timer.set(25, true, function () {
   if (Q.jobs.length === 0) return;
   if (Q.inflight >= (Q.jobs[0].u ? 4 : 2)) return;
   var j = Q.jobs.splice(0, 1)[0];
@@ -169,20 +166,14 @@ function dispatchOne() {
         }
         if (ud.cb && (ec === 0 || ud.r === undefined || ud.r > 2))
           ud.cb(r, ec, em);
-        pump();
       },
       j,
     );
   } catch (e) {
     Q.inflight--;
-    Q.jobs.unshift(j);
-    if (Q.retryTimer === null)
-      Q.retryTimer = Timer.set(100, false, function () {
-        Q.retryTimer = null;
-        pump();
-      });
+    Q.jobs.unshift(j); // budget race with firmware: retry next tick
   }
-}
+});
 
 function bothOff() {
   setOut(UP, false);
@@ -432,9 +423,18 @@ function request(dir, source) {
 
   if (S.state !== "IDLE") return "busy";
 
-  if (outOn(UP) || outOn(DOWN)) {
+  if (rogueOn()) {
     fault("output ON while believed IDLE");
     return "fault";
+  }
+  if (outOn(UP) || outOn(DOWN)) {
+    // our own OFF is still landing (queue lag): keep the gesture armed
+    if (source === "input") {
+      S.lastTapDir = dir;
+      S.lastTapTs = Date.now();
+    }
+    log("outputs settling — press again");
+    return "settling";
   }
   if (inOn(dir === UP ? DOWN : UP)) {
     log("opposite input held — refusing " + DIR_NAME[dir]);
@@ -466,7 +466,14 @@ function request(dir, source) {
 
 function startTrip(source) {
   if (outOn(UP) || outOn(DOWN)) {
-    fault("output ON at trip start");
+    if (rogueOn()) {
+      fault("output ON at trip start");
+    } else {
+      // our own OFF command hasn't landed yet (queue lag): abort quietly
+      log("outputs still settling — trip aborted, press again");
+      S.forceLatch = false;
+      cooldown();
+    }
     return;
   }
   // RUNNING before energizing: a press landing between here and relay closure
