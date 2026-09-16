@@ -159,7 +159,10 @@ test("push opposite mid-run: reversed run inherits push semantics", () => {
   env.advance(1000);
   const st = env.http("");
   assert(!env.outputs[DOWN], "reversed push did not stop on release");
-  assert(st.state === "IDLE", "not idle after reversed push: " + JSON.stringify(st));
+  assert(
+    st.state === "IDLE",
+    "not idle after reversed push: " + JSON.stringify(st),
+  );
   baseline(env);
 });
 

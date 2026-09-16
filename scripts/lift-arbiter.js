@@ -467,10 +467,6 @@ var LiftArbiter = /** @class */ (function () {
                 this.armHoldEscape(direction);
             }
         }
-        if (this.state === "FAULT" /* MachineState.Fault */) {
-            this.log("ignored " + DIRECTION_NAME[direction] + " (" + source + "): FAULT lockout");
-            return "fault";
-        }
         if (this.calibrating && source === "input" /* RequestSource.Input */) {
             this.log("ignored " + DIRECTION_NAME[direction] + ": calibration in progress");
             return "calibrating";
@@ -478,37 +474,42 @@ var LiftArbiter = /** @class */ (function () {
         if (source === "input" /* RequestSource.Input */) {
             this.log("press " + DIRECTION_NAME[direction] + " (" + this.state + ")");
         }
-        if (this.state === "RUNNING" /* MachineState.Running */) {
-            if (direction !== this.direction) {
-                // opposite press = immediate stop, dead-time, full travel the other way
-                this.reverseTo = direction;
-                this.stopRun("reverse to " + DIRECTION_NAME[direction] + " (" + source + ")");
-                return "reversing";
-            }
-            if (source !== "input" /* RequestSource.Input */)
-                return "already-running";
-            // same-direction press during a run = deliberate stop
-            this.reverseTo = null;
-            this.stopRun("same-direction press");
-            return "stopped";
+        switch (this.state) {
+            case "FAULT" /* MachineState.Fault */:
+                this.log("ignored " + DIRECTION_NAME[direction] + " (" + source + "): FAULT lockout");
+                return "fault";
+            case "RUNNING" /* MachineState.Running */:
+                if (direction !== this.direction) {
+                    // opposite press = immediate stop, dead-time, full travel the other way
+                    this.reverseTo = direction;
+                    this.stopRun("reverse to " + DIRECTION_NAME[direction] + " (" + source + ")");
+                    return "reversing";
+                }
+                if (source !== "input" /* RequestSource.Input */)
+                    return "already-running";
+                // same-direction press during a run = deliberate stop
+                this.reverseTo = null;
+                this.stopRun("same-direction press");
+                return "stopped";
+            case "IDLE" /* MachineState.Idle */:
+                if (this.rogueOutputOn()) {
+                    this.fault("output ON while believed IDLE");
+                    return "fault";
+                }
+                if (this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */)) {
+                    this.log("outputs settling — press again");
+                    return "settling";
+                }
+                if (this.inputOn(this.opposite(direction))) {
+                    this.log("opposite input held — refusing " + DIRECTION_NAME[direction]);
+                    this.cooldown();
+                    return "conflict";
+                }
+                this.direction = direction;
+                return this.startRun() ? "accepted" : "aborted";
+            default:
+                return "busy"; // COOLDOWN settling
         }
-        if (this.state !== "IDLE" /* MachineState.Idle */)
-            return "busy"; // COOLDOWN settling
-        if (this.rogueOutputOn()) {
-            this.fault("output ON while believed IDLE");
-            return "fault";
-        }
-        if (this.outputOn(0 /* Direction.Up */) || this.outputOn(1 /* Direction.Down */)) {
-            this.log("outputs settling — press again");
-            return "settling";
-        }
-        if (this.inputOn(this.opposite(direction))) {
-            this.log("opposite input held — refusing " + DIRECTION_NAME[direction]);
-            this.cooldown();
-            return "conflict";
-        }
-        this.direction = direction;
-        return this.startRun() ? "accepted" : "aborted";
     };
     // Firmware Auto-Off still backs up every run, latched or held.
     LiftArbiter.prototype.startRun = function () {

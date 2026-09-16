@@ -603,11 +603,6 @@ class LiftArbiter {
       }
     }
 
-    if (this.state === MachineState.Fault) {
-      this.log("ignored " + DIRECTION_NAME[direction] + " (" + source + "): FAULT lockout");
-      return "fault";
-    }
-
     if (this.calibrating && source === RequestSource.Input) {
       this.log("ignored " + DIRECTION_NAME[direction] + ": calibration in progress");
       return "calibrating";
@@ -617,42 +612,49 @@ class LiftArbiter {
       this.log("press " + DIRECTION_NAME[direction] + " (" + this.state + ")");
     }
 
-    if (this.state === MachineState.Running) {
-      if (direction !== this.direction) {
-        // opposite press = immediate stop, dead-time, full travel the other way
-        this.reverseTo = direction;
-        this.stopRun("reverse to " + DIRECTION_NAME[direction] + " (" + source + ")");
-        return "reversing";
-      }
+    switch (this.state) {
+      case MachineState.Fault:
+        this.log("ignored " + DIRECTION_NAME[direction] + " (" + source + "): FAULT lockout");
+        return "fault";
 
-      if (source !== RequestSource.Input) return "already-running";
+      case MachineState.Running:
+        if (direction !== this.direction) {
+          // opposite press = immediate stop, dead-time, full travel the other way
+          this.reverseTo = direction;
+          this.stopRun("reverse to " + DIRECTION_NAME[direction] + " (" + source + ")");
+          return "reversing";
+        }
 
-      // same-direction press during a run = deliberate stop
-      this.reverseTo = null;
-      this.stopRun("same-direction press");
-      return "stopped";
+        if (source !== RequestSource.Input) return "already-running";
+
+        // same-direction press during a run = deliberate stop
+        this.reverseTo = null;
+        this.stopRun("same-direction press");
+        return "stopped";
+
+      case MachineState.Idle:
+        if (this.rogueOutputOn()) {
+          this.fault("output ON while believed IDLE");
+          return "fault";
+        }
+
+        if (this.outputOn(Direction.Up) || this.outputOn(Direction.Down)) {
+          this.log("outputs settling — press again");
+          return "settling";
+        }
+
+        if (this.inputOn(this.opposite(direction))) {
+          this.log("opposite input held — refusing " + DIRECTION_NAME[direction]);
+          this.cooldown();
+          return "conflict";
+        }
+
+        this.direction = direction;
+        return this.startRun() ? "accepted" : "aborted";
+
+      default:
+        return "busy"; // COOLDOWN settling
     }
-
-    if (this.state !== MachineState.Idle) return "busy"; // COOLDOWN settling
-
-    if (this.rogueOutputOn()) {
-      this.fault("output ON while believed IDLE");
-      return "fault";
-    }
-
-    if (this.outputOn(Direction.Up) || this.outputOn(Direction.Down)) {
-      this.log("outputs settling — press again");
-      return "settling";
-    }
-
-    if (this.inputOn(this.opposite(direction))) {
-      this.log("opposite input held — refusing " + DIRECTION_NAME[direction]);
-      this.cooldown();
-      return "conflict";
-    }
-
-    this.direction = direction;
-    return this.startRun() ? "accepted" : "aborted";
   }
 
   // Firmware Auto-Off still backs up every run, latched or held.

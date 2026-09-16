@@ -38,16 +38,16 @@ Firmware Auto-Off is the backstop: if the script crashes or is stopped mid-trip,
 
 States: `IDLE → RUNNING → COOLDOWN → IDLE`, plus `FAULT`. **No press-count gestures, no modes** — what the paddle does depends only on how long it's held and what the lift is doing:
 
-| Control                                              | Result                                                                                                                                       |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Press** (tap, released < 1 s)                      | Latched full run that direction, energized immediately                                                                                       |
-| **Push** (hold ≥ 1 s)                                | Runs while held; **release stops it** (hold-to-run / jog)                                                                                     |
-| **Same-direction press during a run**                | **STOP**                                                                                                                                     |
-| **Opposite press during a run**                      | **REVERSE**: immediate stop, dead-time, then run the other way (tap = latched; keep holding = push rules apply to the reversed run)          |
-| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                                                                               |
-| **External `Switch.Set` ON** (management UI / RPC)   | **ADOPTED as a governed run** — stop/reverse rules all apply; conflicting or unexplained outputs still FAULT                                 |
-| External `Switch.Set` OFF mid-run                    | Treated as a stop, **not** a floor declaration (aborts calibration)                                                                          |
-| **Hold either paddle 3 s during FAULT/calibration**  | **Hard reset / lockout escape** (keeps position)                                                                                             |
+| Control                                              | Result                                                                                                                              |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Press** (tap, released < 1 s)                      | Latched full run that direction, energized immediately                                                                              |
+| **Push** (hold ≥ 1 s)                                | Runs while held; **release stops it** (hold-to-run / jog)                                                                           |
+| **Same-direction press during a run**                | **STOP**                                                                                                                            |
+| **Opposite press during a run**                      | **REVERSE**: immediate stop, dead-time, then run the other way (tap = latched; keep holding = push rules apply to the reversed run) |
+| Run reaches a limit (Auto-Off / dead reckoning / S3) | Floor declared                                                                                                                      |
+| **External `Switch.Set` ON** (management UI / RPC)   | **ADOPTED as a governed run** — stop/reverse rules all apply; conflicting or unexplained outputs still FAULT                        |
+| External `Switch.Set` OFF mid-run                    | Treated as a stop, **not** a floor declaration (aborts calibration)                                                                 |
+| **Hold either paddle 3 s during FAULT/calibration**  | **Hard reset / lockout escape** (keeps position)                                                                                    |
 
 **Calibration is remote-only** (`?cmd=calibrate`): full-UP ride, paddle IGNORED until Auto-Off → top / 100%, exits to normal automatically. Escapes during the locked ride: hold either paddle 3 s, `?cmd=stop`, `?cmd=reset`.
 
