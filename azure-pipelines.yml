@@ -1,0 +1,21 @@
+# Mirrors every branch/tag push to github.com/ianwesterfield/<repo-name>
+trigger:
+  branches:
+    include:
+      - '*'
+  tags:
+    include:
+      - '*'
+
+pool:
+  name: Default
+
+variables:
+  - group: github-mirror
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+
+  - script: git push --force https://$(GITHUB_PAT)@github.com/ianwesterfield/$(Build.Repository.Name).git HEAD:$(Build.SourceBranch)
+    displayName: Mirror to GitHub
